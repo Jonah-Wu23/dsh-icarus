@@ -181,7 +181,7 @@ test('list filters by owner, status and kind and orders by creation', t => {
 test('a failing snapshot write rolls create and modify back completely', t => {
   const dshHome = mkdtempSync(join(tmpdir(), 'icarus-tx-'))
   const blocking = {
-    version: 2,
+    version: MIGRATIONS.length + 1,
     name: 'test-block-revisions',
     sql: "CREATE TRIGGER test_block_revision BEFORE INSERT ON MissionRevision BEGIN SELECT RAISE(ABORT, 'blocked for test'); END;",
   }

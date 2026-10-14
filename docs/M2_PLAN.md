@@ -116,6 +116,10 @@ M2.4 依赖 M2.3 的执行器收口；M2.5 依赖 M2.3 的执行会话。M2.3 �
 - **预留在内存，不落库**：M2.4 的预留 = claim 时读到的 `budget - budgetUsed`，只作为本次 Run 的可用上限存在执行器内存里，没有 `Run.budgetReserved` 列。理由：M2.3 串行执行，没有并发方需要看见这份预留；落库反而会给人"闸门已考虑预留"的错觉。M4 做并发时按此接缝补齐——0002 迁移加 `Run.budgetReserved`，闸门从 `budgetUsed >= budget` 改成 `budgetUsed + 活跃预留 >= budget`，并在结算时释放预留。
 - **无估算式预留（留 M4）**：闸门只看已结算量（`budgetUsed >= budget` → 零调用），不做"输入规模估算 + 用户设定的最大输出"的预检。真正的预留式闸门需要先有估算策略与用户可配的上限，属 M4 并发+预算策略，M2.4 不擅自加参数。
 - **超支不销毁成果（拍板）**：超上限判定发生在模型调用之后（token 已消耗），因此 M2.4 采取"超上限照常核对、落库、投递，Run 记 `succeeded`，真实用量结算进 `budgetUsed`"。上限阻止的是新增调用（claim 闸门），不是已付费的交付。超支后 `budgetUsed > budget`、Run 视图 `remaining` 为负，超支记录在 `runs/<id>/budget.txt`（`kind: budget-overrun`，含 reserved/spent/overshoot），并在交付文本里显式提示；闸门在下一个 Run 生效。`runs/<id>/budget.txt` 的另一种是 `kind: budget-exhausted`（闸门拒绝，零调用）。
+- **M2.5 审批绑定（已落地）**：绑定不新增宿主接口——执行器监听自己创建的会话，把 `approval/asked`（`{id, toolName, callId?, reason?}`）与 `approval/decided`（`{id, outcome}`）折叠进 `Run.approvalRefs`（0002 迁移，`TEXT NOT NULL DEFAULT '[]'`，DB 存结构化链，原文留在执行会话日志）。Icarus 不注册应答者、不自动放行、不起自己的审批计时器；outcome 词表是宿主的封闭集合 `allowed-once/rejected/cancelled/unavailable`。
+- **`awaiting_approval` 是执行中状态，不是终态**：租约照常续（否则慢的人工答复必然租约过期、批准也无法提交）；`committable`/`finish`/`commit`/`recordUsage`/`attachSession`/`markSuperseded` 的状态条件统一放宽为 `status IN ('running','awaiting_approval')`。结算仍只由终态那一次条件 UPDATE 触发，挂起本身不结算；同一 turn 内可有多个未决请求，状态由链推导（还有 open 就保持 `awaiting_approval`，最后一条决定才回 `running`）。
+- **拒绝/取消/无应答都不杀 Run（D4 拍板）**：宿主拒绝只废那一次工具调用，回合照常 `completed`，一见 `rejected` 就判死会造成「turn 在跑、Run 已终态」的自残冲突，与 M2.4 超支同理。终局由 turn 收口 + 要求核对决定：核对通过 → 交付，交付文本必带「本次执行有 N 次审批未获通过：<工具>（<outcome>）」，绝不静默交付；核对不过 → `failed`，`runs/<id>/error.txt` 必含完整 asked/decided 配对（`requestId`/`toolName`/`callId`/`outcome`/两个时间戳）。
+- **错误档案固定结构（已落地）**：`runs/<id>/error.txt` = 头部（Run / Mission / revision / generation / 时间 / kind / detail / session / usage）+ 审批链（含仍 open 的请求）+ 工具错误（`tool/result` 的 `message` 与 `error.info`，按 callId 反查 `tool/call` 的名字）+ raw JSON（turn reason 原文；未捕获异常记 name、message 与前四行堆栈）。只有失败路径写这份档案，交付路径不碰它。
 
 ## 3. M2 总验收（联调，真实宿主）
 
@@ -130,3 +134,89 @@ M2.4 依赖 M2.3 的执行器收口；M2.5 依赖 M2.3 的执行会话。M2.3 �
 - 不接真实来源采集（M3），M2.3 的「成果」由执行会话直接产出。
 - 不做反馈与偏好整理（M4）、不做任何界面（M5）、不接 Telegram（M5）。
 - 不写宿主 `schedule` 服务、不改 ds-bot 任何文件、不写 `state.json`（M1 已立禁令，延续有效）。
+
+## 5. M2.5 实现计划（Dev 提交，待 Chief 过）
+
+日期：2026-10-14 · 依据：本文 §M2.5 任务、§0 接口核对、宿主审批运行面核验（只读 `.work/host-0.2.0-rc.2`，核验时间 2026-10-14）
+
+### 5.1 已钉死的宿主事实
+
+| 点 | 事实 | 依据 |
+|---|---|---|
+| 审计事件 | `approval/asked` = `{id, toolName, callId?, reason?}`；`approval/decided` = `{id, outcome}`；`approval/policy` = `{policy}` | `dsh-user-approval/lib/types/index.js:129-136` |
+| outcome 词表 | `allowed-once` / `rejected` / `cancelled` / `unavailable`，封闭集合 | 同上 `:15`、`lib/types/invariant.js:202-215` |
+| 可观察性 | `session.append` 之后对**全部**事件类型广播 `session/event`，含以上三种 | `dsh-session/lib/index.js:1441-1474` |
+| 轮次前提 | 审批只在未结束的轮次内发生，事件对同轮配对 | `dsh-user-approval/lib/types/index.js:123-127` |
+| 谁应答 | 桌面走 scoped Remote（GUI：同意→`allowed-once`，拒绝→`rejected`）；ACP 为另一应答者，必须带 callId | `dsh-api-remotes/lib/index.js:147-157`、`dsh-client-ui-approval/lib/client.js:79,124,131,355-357`、`dsh-acp/lib/index.js:1116-1138` |
+| 无人应答 | waterfall 兜底 `unavailable`（fail closed）；非法返回值与监听器抛错同样归一为 `unavailable` | `dsh-user-approval/lib/index.js:176` |
+| 超时 | 审批侧没有自己的计时器；超时来自调用方 signal（工具 `timeoutMs` 造的 deadline），一响即 `cancelled` | `dsh-timeout/lib/index.js:57-73`、`dsh-tool-call-timeout-policy/lib/index.js:80-108` |
+| 错误素材 | 工具拒绝物化为 `{content:[{type:'text',text:'Error: '+reason}], isError:true, error:{message, info?}}`；**没有 code/status/requestId**，requestId 只存在于 `approval/asked.id` | `dsh-tools/lib/index.js:3243-3257, 3463-3490, 3616-3630` |
+| 回合结局 | 工具错误不终止回合，`turn/end` 通常仍是 `{kind:'completed'}`；只有被打断才是 `{kind:'aborted'}` | `dsh-agent-loop/lib/index.js:731-745, 1008-1030` |
+
+结论：绑定不需要宿主开新接口，也不由 Icarus 发起审批——沙箱升级这类敏感动作在执行会话内自会被宿主路由到审批 seam，Icarus 只需监听自己创建的会话。
+
+### 5.2 设计决定
+
+**D1 绑定路径 = 复用执行器现有的 `session/event` 监听**（`src/execution/executor.ts:152-175`）。监听器已按 Run 的 sessionId 建索引，审批事件与会话归属天然对齐；不新增监听器，不新增宿主依赖。
+
+**D2 存储 = 0002 迁移给 Run 加 `approvalRefs TEXT NOT NULL DEFAULT '[]'`。** DB 存结构化链（每条：`requestId / toolName / callId? / reason? / outcome / askedAt / decidedAt`），原始证据不复制——执行会话日志本身就是原文，`Run.sessionId` 已有指针。这是 §M2.5 写了、但 0001 没落的列：补迁移，不改已应用迁移。
+
+**D3 `awaiting_approval` = 「执行中」的另一种形态。** 租约照常续（否则人工审批稍慢就租约过期，批准也提交不了）；`committable` / `finish` / `commit` / `recordUsage` / `attachSession` / `markSuperseded` 的状态条件统一放宽为 `status IN ('running','awaiting_approval')`。条件 UPDATE 的「只结算一次」语义不变，CHECK 域不动。
+
+**D4 决定不杀 Run（需 Chief 裁定，本节与 §M2.5 单行措辞的唯一偏离）。** §M2.5 写「拒绝 → failed」，但宿主事实是：拒绝只让那一次工具调用返回错误，回合照常继续、通常仍以 `completed` 收尾。若一见 `rejected` 就把 Run 判死，就会出现「turn 还在跑、Run 已终态」，随后 commit 必然冲突——等于亲手作废一次已付费的执行，和 M2.4 超支拍板同一条道理。因此 `rejected` / `cancelled` / `unavailable` 一律只入链，Run 终局仍由 turn 收口 + 要求核对决定：核对不过 → `failed`，错误档案必带完整审批链；核对通过 → 交付，交付文本显式标注「本次执行有审批被拒」。请过计划时明确批这一条。
+
+**D5 错误档案 = 一份固定结构的原文文件。** `errorRef` 仍指向 `runs/<id>/error.txt`（失败）或 `budget.txt`（闸门/超支），DB 不新增摘要列。文件结构：头部（Run / Mission / revision / generation / 时间 / kind / detail）+ 审批链 + 工具错误（按序，`message` + `info`）+ turn 结束时 reason 原文 JSON + usage。失败档案只能由失败路径写，交付文本不能覆盖它。
+
+**D6 不做**：不注册应答者（自动化测试用的测试应答者只存在于 test 目录）、不自动放行任何 `rejected/cancelled/unavailable`、不自己起审批计时器（沿用执行超时兜底）、移动端答复属 M5。
+
+### 5.3 改动清单
+
+| 文件 | 动作 | 要点 |
+|---|---|---|
+| `src/storage/schema/0002-run-approvals.ts` | 新增 | `ALTER TABLE Run ADD COLUMN approvalRefs TEXT NOT NULL DEFAULT '[]'` |
+| `src/storage/schema/index.ts` | 改 | 追加 0002，编号保持连续 |
+| `src/execution/runs.ts` | 改 | `Run.approvalRefs`、`ApprovalRef` 类型、`RunView.approvals`；新增 `markAwaitingApproval` / `resumeFromApproval` / `recordApproval`；状态条件放宽（D3） |
+| `src/execution/executor.ts` | 改 | 审批事件折叠进 TurnTracker；`tool/result` 错误原文收集；状态翻转；失败档案结构 |
+| `src/execution/index.ts` | 改 | 导出 `ApprovalRef` |
+| `test/execution-approval.test.js` | 新增 | 见 5.5 |
+| `test/execution-errors.test.js` | 新增 | 失败档案内容 |
+| `test/storage-schema.test.js` | 改 | 0002 幂等 + 老库升级 |
+| `test/helpers/execution-harness.js` | 改 | `approvalAsked` / `approvalDecided` / `toolError` 事件构造器 |
+| `docs/M2_PLAN.md` | 改 | 本节定稿后把拍板结论并入 §1 已确认接缝 |
+
+### 5.4 状态流
+
+```
+claim(running)
+  ├─ approval/asked        → awaiting_approval（asked 入链，租约照续）
+  ├─ approval/decided      → running（outcome 入链）
+  │    allowed-once                        → 继续
+  │    rejected/cancelled/unavailable      → 只入链，继续（D4）
+  ├─ turn/end completed    → 核对 → commit(succeeded) / finish(failed + 档案)
+  ├─ turn/end 非 completed → finish(failed + 档案)
+  ├─ 执行超时              → finish(failed；链尾仍是 asked 时档案 kind: approval-timeout)
+  └─ 租约过期 / 宿主重启   → superseded（人工答复作废，新 generation 重排队）
+```
+
+### 5.5 测试与验收
+
+node:test（预计新增 12 条左右）：
+
+1. asked → allowed-once：执行中 Run 为 `awaiting_approval`，链落库，最终 `succeeded`。
+2. asked → rejected 且成果成立：`succeeded`，交付文本含审批被拒标注，链里有 outcome。
+3. asked → rejected 且成果不成立：`failed`，`error.txt` 含审批链 + 工具错误 `message`/`info`。
+4. `cancelled`（signal abort）与 `unavailable`（无应答者）各一条断言。
+5. 挂起期间 `renew` 生效：跨过 `leaseMs` 仍可 commit，不被 supersede。
+6. 挂起 Run 租约过期 → `recoverExpired` 转 superseded + 重排队，且人工答复不再能提交。
+7. 审批不改变结算次数：挂起前后各一次终态写，`budgetUsed` 只加一次。
+8. 0002 迁移：只有 0001 的老库升级后历史 Run `approvalRefs` 为 `[]`；重复打开幂等。
+
+真实宿主联调（Chief 验收）：
+
+- 执行会话内跑一个必须升级权限的动作（工作区外写入）→ GUI 弹审批 → 同意：Run 链里 `allowed-once`；拒绝：链里 `rejected`，检查后续 Run 状态与档案。
+- 无人应答场景（无头/无应答者）：链里 `unavailable`，动作以拒绝关闭，Run 不自动放行。
+
+### 5.6 风险
+
+- 执行超时默认 10 min 可能短于人工审批等待：超时后走 fail-closed，档案标明链尾仍在等待。M5 接移动端答复时再评估是否给审批期单独计时。
+- `session/event` 是提交后的观察者，写库失败不影响宿主派发；审批链落库失败只 warn（与 usage 记录同一策略），不阻断执行。

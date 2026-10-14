@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  MIGRATIONS,
   artifactsDirOf,
   dataDirOf,
   databasePathOf,
@@ -79,7 +80,7 @@ test('data locations resolve under $DSH_HOME/icarus', () => {
 test('opening creates the data spaces and sets WAL, busy_timeout and foreign keys', t => {
   const { database } = openHome(t)
 
-  assert.equal(database.schemaVersion, 1)
+  assert.equal(database.schemaVersion, 2)
   assert.equal(database.db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal')
   assert.equal(database.db.prepare('PRAGMA busy_timeout').get().timeout, 5000)
   assert.equal(database.db.prepare('PRAGMA foreign_keys').get().foreign_keys, 1)
@@ -103,9 +104,34 @@ test('reopening the same file applies nothing and leaves the schema identical', 
     drop()
   })
   assert.equal(schemaDump(second.db), firstDump)
-  assert.deepEqual(firstMigrations, [1])
-  assert.deepEqual(migrationsOf(second.db), [1])
-  assert.equal(second.schemaVersion, 1)
+  assert.deepEqual(firstMigrations, [1, 2])
+  assert.deepEqual(migrationsOf(second.db), [1, 2])
+  assert.equal(second.schemaVersion, 2)
+})
+
+test('upgrading a 0001 database adds the approval chain without touching existing Runs', t => {
+  const { dshHome, drop } = tempHome(t)
+  // A database written by the M2.4 build: 0001 only, plus one Run that predates approvals.
+  const legacy = openDatabase({ dshHome, migrations: [MIGRATIONS[0]] })
+  legacy.db.prepare(`INSERT INTO Mission (id, ownerBotId, kind, objective, requirements, revision, status, schedule, timezone, budget, authorizationRef, budgetUsed, nextDueAt, createdAt, updatedAt)
+    VALUES ('mission_legacy', 'session-bot-1', 'recurring', 'legacy', '[]', 1, 'active', '{"kind":"daily","time":"21:00"}', 'Asia/Singapore', 1000, NULL, 0, NULL, 1, 1)`).run()
+  legacy.db.prepare(`INSERT INTO Run (id, missionId, missionRevision, preferenceRevision, status, sessionId, leaseOwner, leaseUntil, inputRefs, usage, errorRef, generation, createdAt, startedAt, endedAt)
+    VALUES ('run_legacy', 'mission_legacy', 1, NULL, 'succeeded', NULL, NULL, NULL, '[]', NULL, NULL, 1, 1, 1, 2)`).run()
+  assert.equal(legacy.schemaVersion, 1)
+  legacy.close()
+
+  const upgraded = openDatabase({ dshHome })
+  t.after(() => {
+    upgraded.close()
+    drop()
+  })
+  assert.equal(upgraded.schemaVersion, 2)
+  assert.deepEqual(migrationsOf(upgraded.db), [1, 2])
+  assert.deepEqual(columnsOf(upgraded.db, 'Run').filter(name => name.startsWith('approval')), ['approvalRefs'])
+  // The default is what keeps a pre-approval Run readable as an empty chain, not a null.
+  const row = upgraded.db.prepare('SELECT approvalRefs, status FROM Run WHERE id = ?').get('run_legacy')
+  assert.equal(row.approvalRefs, '[]')
+  assert.equal(row.status, 'succeeded')
 })
 
 test('the eight PRD §8.1 tables carry every PRD field', t => {

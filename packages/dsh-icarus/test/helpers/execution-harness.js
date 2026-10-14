@@ -28,6 +28,50 @@ export function turnEndEvent(reason) {
   return { type: 'turn/end', time: 0, data: { turn: 1, reason } }
 }
 
+/** `approval/asked`: the host's audit of one request, `{ id, toolName, callId?, reason? }`. */
+export function approvalAskedEvent({ id, toolName, callId, reason }) {
+  return {
+    type: 'approval/asked',
+    time: 0,
+    data: { id, toolName, ...(callId === undefined ? {} : { callId }), ...(reason === undefined ? {} : { reason }) },
+  }
+}
+
+/** `approval/decided`: `{ id, outcome }` over the host's closed vocabulary. */
+export function approvalDecidedEvent(id, outcome) {
+  return { type: 'approval/decided', time: 0, data: { id, outcome } }
+}
+
+/** `tool/call`: what the failure archive uses to name the tool a result came from. */
+export function toolCallEvent(callId, name, args = {}) {
+  return { type: 'tool/call', time: 0, data: { turn: 1, step: 1, callId, name, arguments: args } }
+}
+
+/** `tool/result` for a failed call: the message the model sees, plus the host's `error.info`. */
+export function toolErrorEvent(callId, text, info) {
+  return {
+    type: 'tool/result',
+    time: 0,
+    data: {
+      turn: 1,
+      step: 1,
+      message: {
+        role: 'tool',
+        source: { kind: 'tool', callId },
+        toolCallId: callId,
+        content: [{ type: 'text', text }],
+        isError: true,
+      },
+      ...(info === undefined ? {} : { error: info }),
+    },
+  }
+}
+
+/** The Run id an execution Session belongs to, as the plugin recorded it. */
+export function runIdOfSession(harness, sessionId) {
+  return harness.database.db.prepare('SELECT id FROM Run WHERE sessionId = ?').get(sessionId).id
+}
+
 /** Emit one completed turn for a Session. */
 export function completeTurn(host, sessionId, text, usage) {
   host.emit(sessionId, assistantEvent(text, usage))

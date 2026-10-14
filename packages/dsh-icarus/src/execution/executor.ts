@@ -18,17 +18,18 @@ import { wallClockOf } from '../domain/timezone.js'
 import { absoluteArtifactPath, artifactRef, contentHash, writeArtifact } from './artifacts.js'
 import { OUTBOX_CHANNEL_BOT } from './outbox.js'
 import { MIN_RESULT_CHARS, checkDeliverable } from './requirements.js'
-import { SupersededError, spentTokens } from './runs.js'
+import { APPROVAL_OUTCOMES, SupersededError, spentTokens } from './runs.js'
 import type { Mission, MissionRevision, MissionService } from '../domain/index.js'
 import type { IcarusDatabase, IcarusPaths } from '../storage/index.js'
 import type { IcarusContext, SessionEventLike } from '../types/host.js'
 import type { OutboxService } from './outbox.js'
-import type { Run, RunStore, TokenUsage } from './runs.js'
+import type { ApprovalOutcome, ApprovalRef, ApprovalRequest, Run, RunStore, TokenUsage } from './runs.js'
 
 export const DEFAULT_LEASE_MS = 5 * 60_000
 export const DEFAULT_EXECUTION_TIMEOUT_MS = 10 * 60_000
 export const DEFAULT_DELIVERY_MAX_CHARS = 4_000
 const MAX_EVIDENCE_LINKS = 20
+const MAX_TOOL_ERRORS = 20
 
 export type ExecutionStatus = 'succeeded' | 'failed' | 'cancelled' | 'superseded' | 'budget_exhausted' | 'abandoned' | 'skipped'
 
@@ -96,9 +97,24 @@ type TurnEnd =
   | { readonly kind: 'timeout' }
   | { readonly kind: 'abandoned' }
 
-/** One execution turn: the assistant text and usage it produced, and how it ended. */
+/** One tool result the host marked as an error, kept raw for the failure archive. */
+interface ToolErrorRecord {
+  readonly callId: string | null
+  readonly toolName: string | null
+  readonly message: string
+  /** `result.error.info` when the host attached one (a timeout carries `code: TOOL_TIMEOUT`). */
+  readonly info?: unknown
+}
+
+/**
+ * One execution turn: the assistant text and usage it produced, the tool errors it hit, and how
+ * it ended. Approvals are not mirrored here — the store's chain is their single source of truth.
+ */
 class TurnTracker {
   readonly texts: string[] = []
+  readonly toolErrors: ToolErrorRecord[] = []
+  /** Tool names by call id, so a tool error can name the tool it came from. */
+  readonly callNames = new Map<string, string>()
   usage: TokenUsage | null = null
   private settled = false
   private timer: TimerHandle | undefined
@@ -111,6 +127,11 @@ class TurnTracker {
       resolve = settle
     })
     this.resolve = resolve
+  }
+
+  /** Bound what a runaway turn can put into the failure archive. */
+  remember(error: ToolErrorRecord): void {
+    if (this.toolErrors.length < MAX_TOOL_ERRORS) this.toolErrors.push(error)
   }
 
   settle(end: TurnEnd): void {
@@ -171,6 +192,44 @@ export function createExecutor(options: ExecutorOptions): Executor {
       }
       return
     }
+    if (event.type === 'tool/call') {
+      const callId = stringOf(event.data?.callId)
+      const name = stringOf(event.data?.name)
+      if (callId !== null && name !== null) turn.callNames.set(callId, name)
+      return
+    }
+    if (event.type === 'tool/result') {
+      // A rejected or timed-out tool call lands here as an error result; it is the raw material
+      // the failure archive keeps, because the approval event itself carries no error detail.
+      const failure = toolErrorOf(event, turn)
+      if (failure !== null) turn.remember(failure)
+      return
+    }
+    if (event.type === 'approval/asked') {
+      const request = approvalRequestOf(event)
+      if (request === null) return
+      try {
+        if (!store.markAwaitingApproval(turn.runId, options.instanceId, request)) {
+          ctx.logger.warn('icarus: Run %s is no longer executing; approval %s was not bound', turn.runId, request.requestId)
+        }
+      } catch (error) {
+        // The host's dispatch must survive a failed bookkeeping write.
+        ctx.logger.warn('icarus: could not bind approval %s to Run %s: %s', request.requestId, turn.runId, errorText(error))
+      }
+      return
+    }
+    if (event.type === 'approval/decided') {
+      const decision = approvalDecisionOf(event)
+      if (decision === null) return
+      try {
+        if (!store.recordApproval(turn.runId, options.instanceId, decision)) {
+          ctx.logger.warn('icarus: approval %s of Run %s had no open request to close', decision.requestId, turn.runId)
+        }
+      } catch (error) {
+        ctx.logger.warn('icarus: could not record approval %s for Run %s: %s', decision.requestId, turn.runId, errorText(error))
+      }
+      return
+    }
     if (event.type === 'turn/end') turn.settle(endOfEvent(event))
   })
 
@@ -197,26 +256,50 @@ export function createExecutor(options: ExecutorOptions): Executor {
     }
   }
 
-  /** Failure record: the raw error plus whatever the Run had produced, never a rewrite of it. */
-  function failureRecord(run: Run, kind: string, detail: string, raw: unknown): string {
-    const sections = [
-      `Icarus Run ${run.id} failed`,
+  /** The Run's approval chain as stored; a read failure must not swallow the failure itself. */
+  function approvalsOf(runId: string): readonly ApprovalRef[] {
+    try {
+      return store.get(runId).approvalRefs
+    } catch (error) {
+      ctx.logger.warn('icarus: could not read the approval chain of Run %s: %s', runId, errorText(error))
+      return []
+    }
+  }
+
+  /**
+   * The failure archive: everything the Run knows about why it failed, in a fixed order, written
+   * only by a failure path. The approval chain is printed in full — request id, tool, outcome and
+   * both timestamps per request — so a Run blocked by a refused approval is readable without the
+   * host's Session log.
+   */
+  function failureArchive(run: Run, kind: string, detail: string, raw: unknown, turn: TurnTracker | null): string {
+    const approvals = approvalsOf(run.id)
+    const toolErrors = turn?.toolErrors ?? []
+    return [
+      `Icarus Run ${run.id} failure archive`,
       `time: ${new Date(now()).toISOString()}`,
       `kind: ${kind}`,
       `detail: ${detail}`,
       `mission: ${run.missionId} revision ${run.missionRevision} generation ${run.generation}`,
+      `session: ${turn?.sessionId ?? run.sessionId ?? 'none'}`,
+      `usage: ${JSON.stringify(turn?.usage ?? run.usage ?? null)}`,
+      '',
+      `approval chain (${approvals.length}):`,
+      ...(approvals.length === 0 ? ['  none'] : approvals.map(approvalLine)),
+      '',
+      `tool errors (${toolErrors.length}):`,
+      ...(toolErrors.length === 0 ? ['  none'] : toolErrors.map(toolErrorLine)),
       '',
       'raw:',
       JSON.stringify(raw, null, 2),
-    ]
-    return sections.join('\n')
+    ].join('\n')
   }
 
-  function fail(run: Run, usage: TokenUsage | null, kind: string, detail: string, raw: unknown): ExecutionOutcome {
+  function fail(run: Run, turn: TurnTracker | null, kind: string, detail: string, raw: unknown): ExecutionOutcome {
     const ref = artifactRef('runs', run.id, 'error.txt')
-    writeArtifact(paths, ref, failureRecord(run, kind, detail, raw))
+    writeArtifact(paths, ref, failureArchive(run, kind, detail, raw, turn))
     try {
-      store.finish(run.id, options.instanceId, { status: 'failed', usage, errorRef: ref })
+      store.finish(run.id, options.instanceId, { status: 'failed', usage: turn?.usage ?? null, errorRef: ref })
     } catch (error) {
       if (error instanceof SupersededError) return { runId: run.id, status: 'superseded', detail: error.reason }
       throw error
@@ -302,13 +385,23 @@ export function createExecutor(options: ExecutorOptions): Executor {
     return lines.join('\n')
   }
 
-  function deliverableText(text: string, ref: string, run: Run, overshoot: BudgetOvershoot | null): string {
+  /**
+   * The approvals that did not grant, as one delivery line: a refusal is not a reason to discard
+   * a paid-for result, but it must never be delivered silently.
+   */
+  function refusalLine(refusals: readonly ApprovalRef[]): string {
+    if (refusals.length === 0) return ''
+    const detail = refusals.map(entry => `${entry.toolName}（${entry.outcome ?? 'open'}）`).join('、')
+    return `\n\n⚠ 本次执行有 ${refusals.length} 次审批未获通过：${detail}；成果据此产出。`
+  }
+
+  function deliverableText(text: string, ref: string, run: Run, overshoot: BudgetOvershoot | null, refusals: readonly ApprovalRef[]): string {
     const full = absoluteArtifactPath(paths, ref)
     const body = text.length <= deliveryMaxChars ? text : `${text.slice(0, deliveryMaxChars)}\n\n…（正文共 ${text.length} 字，完整内容见 ${full}）`
     const budget = overshoot === null
       ? ''
       : `\n\n⚠ 本次执行超出剩余预算：可用 ${overshoot.reserved} tokens，实际 ${overshoot.spent}（超出 ${overshoot.over}）；Mission 累计用量已更新，后续 Run 会被预算闸门拦下。`
-    return `${body}${budget}\n\n— Icarus｜Run ${run.id}｜Mission ${run.missionId} revision ${run.missionRevision}｜正文 ${text.length} 字｜完整记录：${full}`
+    return `${body}${budget}${refusalLine(refusals)}\n\n— Icarus｜Run ${run.id}｜Mission ${run.missionId} revision ${run.missionRevision}｜正文 ${text.length} 字｜完整记录：${full}`
   }
 
   async function complete(run: Run, turn: TurnTracker, gate: BudgetState): Promise<ExecutionOutcome> {
@@ -319,7 +412,13 @@ export function createExecutor(options: ExecutorOptions): Executor {
     }
     const revision = snapshotOf(run.missionId, run.missionRevision)
     const check = checkDeliverable(text, revision.requirements)
-    if (!check.passed) return fail(run, turn.usage, 'requirement-check', check.failures.join('; '), { text, check })
+    if (!check.passed) return fail(run, turn, 'requirement-check', check.failures.join('; '), { text, check })
+    // A refusal is recorded, never a reason to drop the result: the turn is over and the call is
+    // paid for, so the delivery carries the refusal line instead of the result disappearing.
+    const refusals = approvalsOf(run.id).filter(entry => entry.outcome !== null && entry.outcome !== 'allowed-once')
+    if (refusals.length > 0) {
+      ctx.logger.warn('icarus: Run %s delivered with %d refused approval(s): %s', run.id, refusals.length, refusals.map(entry => `${entry.toolName}:${entry.outcome}`).join(', '))
+    }
     // Spending past the remaining budget is recorded on the Run and in the delivered text, and
     // it settles into Mission.budgetUsed — which is what shuts the gate for every later Run.
     // The result itself is never destroyed: by the time this is known, the call is paid for.
@@ -336,7 +435,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
     const commit = store.commit(run.id, options.instanceId, {
       deliverable: {
         id: newId('deliverable'),
-        content: deliverableText(text, bodyRef, run, overshoot),
+        content: deliverableText(text, bodyRef, run, overshoot, refusals),
         contentHash: contentHash(text),
         requirementResults: check,
         artifactRefs: budgetRef === null ? [bodyRef] : [bodyRef, budgetRef],
@@ -386,14 +485,24 @@ export function createExecutor(options: ExecutorOptions): Executor {
       turn.armTimeout(timeoutMs)
       const end = await turn.done
       if (disposed || end.kind === 'abandoned') return { runId, status: 'abandoned', detail: 'the plugin unloaded while the turn was open' }
-      if (end.kind === 'timeout') return fail(claimed, turn.usage, 'turn-timeout', `no turn/end within ${timeoutMs} ms`, { sessionId: turn.sessionId })
-      if (end.kind === 'ended') return fail(claimed, turn.usage, 'turn-ended', `turn ended with reason ${end.reason}`, { sessionId: turn.sessionId, reason: end.reason })
-      if (end.kind === 'error') return fail(claimed, turn.usage, 'turn-error', end.failure.message, { sessionId: turn.sessionId, failure: end.failure })
+      if (end.kind === 'timeout') {
+        // A timeout with a request still open is named for what actually blocked the turn: the
+        // host has no approval timer of its own, so our wall clock is what ends the wait.
+        const waiting = approvalsOf(claimed.id).some(entry => entry.outcome === null)
+        return waiting
+          ? fail(claimed, turn, 'approval-timeout', `the turn was still waiting for an approval after ${timeoutMs} ms`, { sessionId: turn.sessionId })
+          : fail(claimed, turn, 'turn-timeout', `no turn/end within ${timeoutMs} ms`, { sessionId: turn.sessionId })
+      }
+      if (end.kind === 'ended') return fail(claimed, turn, 'turn-ended', `turn ended with reason ${end.reason}`, { sessionId: turn.sessionId, reason: end.reason })
+      if (end.kind === 'error') return fail(claimed, turn, 'turn-error', end.failure.message, { sessionId: turn.sessionId, failure: end.failure })
       return await complete(claimed, turn, gate)
     } catch (error) {
       if (disposed) return { runId, status: 'abandoned', detail: 'the plugin unloaded during the Run' }
       if (error instanceof SupersededError) return { runId, status: 'superseded', detail: error.reason }
-      return fail(claimed, turn?.usage ?? null, 'execution-error', errorText(error), { sessionId: turn?.sessionId ?? null })
+      return fail(claimed, turn ?? null, 'execution-error', errorText(error), {
+        sessionId: turn?.sessionId ?? null,
+        error: { name: errorName(error), message: errorText(error), stack: stackSummary(error) },
+      })
     } finally {
       if (turn !== undefined) turns.delete(turn.sessionId)
     }
@@ -508,4 +617,79 @@ function linksOf(text: string): readonly string[] {
     if (links.size >= MAX_EVIDENCE_LINKS) break
   }
   return [...links]
+}
+
+function stringOf(value: unknown): string | null {
+  return typeof value === 'string' && value !== '' ? value : null
+}
+
+/** One `tool/result` the host marked as an error, read from the message it answers the call with. */
+function toolErrorOf(event: SessionEventLike, turn: TurnTracker): ToolErrorRecord | null {
+  const message = event.data?.message
+  if (!isRecord(message) || message.isError !== true) return null
+  const content = Array.isArray(message.content) ? message.content : []
+  const text = content
+    .map(block => (isRecord(block) && block.type === 'text' && typeof block.text === 'string' ? block.text : ''))
+    .filter(part => part !== '')
+    .join('\n')
+    .trim()
+  const callId = stringOf(message.toolCallId)
+  return {
+    callId,
+    toolName: callId === null ? null : (turn.callNames.get(callId) ?? null),
+    message: text === '' ? 'the host reported a tool error without text' : text,
+    ...(event.data?.error === undefined ? {} : { info: event.data.error }),
+  }
+}
+
+/** `approval/asked` payload: `{ id, toolName, callId?, reason? }`. */
+function approvalRequestOf(event: SessionEventLike): ApprovalRequest | null {
+  const requestId = stringOf(event.data?.id)
+  const toolName = stringOf(event.data?.toolName)
+  if (requestId === null || toolName === null) return null
+  const callId = stringOf(event.data?.callId)
+  const reason = stringOf(event.data?.reason)
+  return {
+    requestId,
+    toolName,
+    ...(callId === null ? {} : { callId }),
+    ...(reason === null ? {} : { reason }),
+  }
+}
+
+/** `approval/decided` payload: `{ id, outcome }` over the host's closed vocabulary. */
+function approvalDecisionOf(event: SessionEventLike): { readonly requestId: string; readonly outcome: ApprovalOutcome } | null {
+  const requestId = stringOf(event.data?.id)
+  const outcome = event.data?.outcome
+  if (requestId === null || !APPROVAL_OUTCOMES.includes(outcome as ApprovalOutcome)) return null
+  return { requestId, outcome: outcome as ApprovalOutcome }
+}
+
+/** One line per request, the asked/decided pair complete: what the archive must not lose. */
+function approvalLine(entry: ApprovalRef): string {
+  const parts = [
+    `requestId=${entry.requestId}`,
+    `tool=${entry.toolName}`,
+    ...(entry.callId === undefined ? [] : [`callId=${entry.callId}`]),
+    `outcome=${entry.outcome ?? 'open'}`,
+    `askedAt=${new Date(entry.askedAt).toISOString()}`,
+    `decidedAt=${entry.decidedAt === null ? 'open' : new Date(entry.decidedAt).toISOString()}`,
+  ]
+  const reason = entry.reason === undefined ? '' : ` reason=${JSON.stringify(entry.reason)}`
+  return `  - ${parts.join(' ')}${reason}`
+}
+
+function toolErrorLine(record: ToolErrorRecord): string {
+  const info = record.info === undefined ? '' : ` info=${JSON.stringify(record.info)}`
+  return `  - tool=${record.toolName ?? 'unknown'} callId=${record.callId ?? 'unknown'} error=${JSON.stringify(record.message)}${info}`
+}
+
+function errorName(error: unknown): string {
+  return error instanceof Error ? error.name : typeof error
+}
+
+/** The first frames of a stack, kept short: the archive records a summary, not a dump. */
+function stackSummary(error: unknown): string | null {
+  if (!(error instanceof Error) || typeof error.stack !== 'string') return null
+  return error.stack.split('\n').slice(0, 4).join('\n')
 }

@@ -17,10 +17,17 @@
 // budget — every terminal transition writes the Run's status and adds its settled spend to
 // `Mission.budgetUsed` in ONE transaction, and only the transaction that actually changed the
 // status settles. That gives settlement exactly-once per Run without a marker column: the
-// conditional `UPDATE ... WHERE status = 'running'` (or the live-status update on the
-// supersede path) can succeed only once, and a second attempt changes nothing and settles
-// nothing. Spend is input + output tokens; cache read/write stay recorded in `usage` but do
-// not count against the cap.
+// conditional `UPDATE ... WHERE status IN ('running', 'awaiting_approval')` (or the live-status
+// update on the supersede path) can succeed only once, and a second attempt changes nothing and
+// settles nothing. Spend is input + output tokens; cache read/write stay recorded in `usage` but
+// do not count against the cap.
+//
+// approval — `awaiting_approval` is not a terminal state and not a different kind of execution:
+// it is a wait inside the still-open turn, so a waiting Run keeps its lease, keeps recording
+// usage, and may still commit. The host's audit pair (`approval/asked` then `approval/decided`)
+// is folded into `Run.approvalRefs` by the executor; the store only owns the two writes that
+// keep the status and the chain consistent, and both run in one transaction. Settlement is
+// untouched: a decision is not a terminal transition, so an approval wait never charges twice.
 import { newId as mintId } from '../domain/ids.js'
 import { inTransaction } from '../domain/index.js'
 import { nextDueAt } from '../domain/schedule.js'
@@ -46,6 +53,31 @@ export function spentTokens(usage: TokenUsage | null): number {
   return usage.inputTokens + usage.outputTokens
 }
 
+/** The host's closed approval vocabulary; `allowed-once` is the only grant. */
+export const APPROVAL_OUTCOMES = ['allowed-once', 'rejected', 'cancelled', 'unavailable'] as const
+export type ApprovalOutcome = (typeof APPROVAL_OUTCOMES)[number]
+
+/** One host approval request seen in the execution Session, and how it settled. */
+export interface ApprovalRef {
+  /** `approval/asked.id` — the host's request id, the only identity the audit pair carries. */
+  readonly requestId: string
+  readonly toolName: string
+  readonly callId?: string | undefined
+  readonly reason?: string | undefined
+  /** `null` while the request is open; the Run is `awaiting_approval` for exactly that long. */
+  readonly outcome: ApprovalOutcome | null
+  readonly askedAt: number
+  readonly decidedAt: number | null
+}
+
+/** What the execution Session asked the host to approve, before any decision exists. */
+export interface ApprovalRequest {
+  readonly requestId: string
+  readonly toolName: string
+  readonly callId?: string | undefined
+  readonly reason?: string | undefined
+}
+
 export interface Run {
   readonly id: string
   readonly missionId: string
@@ -59,6 +91,8 @@ export interface Run {
   readonly inputRefs: readonly string[]
   readonly usage: TokenUsage | null
   readonly errorRef: string | null
+  /** Every approval the execution Session asked for, in order; open requests have `outcome: null`. */
+  readonly approvalRefs: readonly ApprovalRef[]
   readonly generation: number
   readonly createdAt: number
   readonly startedAt: number | null
@@ -149,6 +183,16 @@ export interface RunStore {
   committable(runId: string, instanceId: string): Run
   /** Terminal outcome of a claimed Run; the generation guard still applies. Settles the spend. */
   finish(runId: string, instanceId: string, outcome: { readonly status: 'failed' | 'cancelled' | 'budget_exhausted'; readonly usage: TokenUsage | null; readonly errorRef?: string | null }): Run
+  /**
+   * Record an open approval request and put the Run into `awaiting_approval`. False when this
+   * instance no longer owns the Run in an executing status.
+   */
+  markAwaitingApproval(runId: string, instanceId: string, request: ApprovalRequest): boolean
+  /**
+   * Close one open request with the host's outcome. The Run goes back to `running` only when no
+   * other request is still open — a decision is not a terminal transition.
+   */
+  recordApproval(runId: string, instanceId: string, decision: { readonly requestId: string; readonly outcome: ApprovalOutcome }): boolean
   /** Persist usage accumulated so far, so a Run superseded mid-flight still settles what it spent. */
   recordUsage(runId: string, instanceId: string, usage: TokenUsage | null): boolean
   /** Persist the deliverable and its pending Outbox row, mark the Run succeeded and settle. */
@@ -188,6 +232,7 @@ interface RunRow {
   readonly inputRefs: string
   readonly usage: string | null
   readonly errorRef: string | null
+  readonly approvalRefs: string
   readonly generation: number
   readonly createdAt: number
   readonly startedAt: number | null
@@ -217,7 +262,14 @@ interface OutboxRow {
 }
 
 const RUN_COLUMNS = `id, missionId, missionRevision, preferenceRevision, status, sessionId, leaseOwner, leaseUntil,
-  inputRefs, usage, errorRef, generation, createdAt, startedAt, endedAt`
+  inputRefs, usage, errorRef, approvalRefs, generation, createdAt, startedAt, endedAt`
+
+/**
+ * The statuses in which a Run is executing. An approval wait is one of them: the turn is still
+ * open, the lease must keep being renewed, and the Run may still commit — only the terminal
+ * transitions are gated on `running` becoming something else.
+ */
+const EXECUTING_STATUSES = `'running', 'awaiting_approval'`
 
 export function createRunStore(database: IcarusDatabase, options: RunStoreOptions): RunStore {
   const now = options.now ?? (() => Date.now())
@@ -238,8 +290,8 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
   function insertQueued(mission: Mission, at: number): string {
     const next = db.prepare('SELECT COALESCE(MAX(generation), 0) + 1 AS next FROM Run WHERE missionId = ?').get<{ next: number }>(mission.id)
     const id = newId('run')
-    db.prepare(`INSERT INTO Run (id, missionId, missionRevision, preferenceRevision, status, sessionId, leaseOwner, leaseUntil, inputRefs, usage, errorRef, generation, createdAt, startedAt, endedAt)
-      VALUES (?, ?, ?, NULL, 'queued', NULL, NULL, NULL, '[]', NULL, NULL, ?, ?, NULL, NULL)`)
+    db.prepare(`INSERT INTO Run (id, missionId, missionRevision, preferenceRevision, status, sessionId, leaseOwner, leaseUntil, inputRefs, usage, errorRef, approvalRefs, generation, createdAt, startedAt, endedAt)
+      VALUES (?, ?, ?, NULL, 'queued', NULL, NULL, NULL, '[]', NULL, NULL, '[]', ?, ?, NULL, NULL)`)
       .run(id, mission.id, mission.revision, next?.next ?? 1, at)
     return id
   }
@@ -252,8 +304,8 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
     const row = db.prepare('SELECT missionId, usage FROM Run WHERE id = ?').get<{ missionId: string; usage: string | null }>(runId)
     if (row === undefined) return 0
     const result = instanceId === null
-      ? db.prepare(`UPDATE Run SET status = 'superseded', endedAt = ? WHERE id = ? AND status IN ('queued', 'running', 'awaiting_approval')`).run(at, runId)
-      : db.prepare(`UPDATE Run SET status = 'superseded', endedAt = ? WHERE id = ? AND status = 'running' AND leaseOwner = ?`).run(at, runId, instanceId)
+      ? db.prepare(`UPDATE Run SET status = 'superseded', endedAt = ? WHERE id = ? AND status IN ('queued', ${EXECUTING_STATUSES})`).run(at, runId)
+      : db.prepare(`UPDATE Run SET status = 'superseded', endedAt = ? WHERE id = ? AND status IN (${EXECUTING_STATUSES}) AND leaseOwner = ?`).run(at, runId, instanceId)
     const changes = Number(result.changes)
     if (changes > 0) settle(row.missionId, row.usage)
     return changes
@@ -335,7 +387,7 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
   function committable(runId: string, instanceId: string): Run {
     const row = rowOrThrow(runId)
     const at = now()
-    if (row.status !== 'running' || row.leaseOwner !== instanceId || row.leaseUntil === null || row.leaseUntil <= at) {
+    if ((row.status !== 'running' && row.status !== 'awaiting_approval') || row.leaseOwner !== instanceId || row.leaseUntil === null || row.leaseUntil <= at) {
       // Superseding settles too, so it commits before the refusal is raised.
       inTransaction(database, () => {
         supersedeRow(runId, instanceId, at)
@@ -353,9 +405,48 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
   }
 
   function recordUsage(runId: string, instanceId: string, usage: TokenUsage | null): boolean {
-    const result = db.prepare(`UPDATE Run SET usage = ? WHERE id = ? AND status = 'running' AND leaseOwner = ?`)
+    const result = db.prepare(`UPDATE Run SET usage = ? WHERE id = ? AND status IN (${EXECUTING_STATUSES}) AND leaseOwner = ?`)
       .run(usage === null ? null : JSON.stringify(usage), runId, instanceId)
     return Number(result.changes) > 0
+  }
+
+  /**
+   * Append one open approval request and mark the Run as waiting. One transaction: the chain
+   * gains the request only if the status write actually landed on a Run this instance owns,
+   * so a request from a superseded execution is never recorded as if it were live.
+   */
+  function markAwaitingApproval(runId: string, instanceId: string, request: ApprovalRequest): boolean {
+    const at = now()
+    return inTransaction(database, () => {
+      const row = readRow(runId)
+      if (row === undefined || row.leaseOwner !== instanceId || (row.status !== 'running' && row.status !== 'awaiting_approval')) return false
+      const chain: ApprovalRef[] = [...parseApprovals(row.approvalRefs), { ...request, outcome: null, askedAt: at, decidedAt: null }]
+      const result = db.prepare(`UPDATE Run SET status = 'awaiting_approval', approvalRefs = ? WHERE id = ? AND status IN (${EXECUTING_STATUSES}) AND leaseOwner = ?`)
+        .run(JSON.stringify(chain), runId, instanceId)
+      return Number(result.changes) > 0
+    })
+  }
+
+  /**
+   * Close one open request with the outcome the host reported. The status follows the chain:
+   * still-open siblings keep the Run in `awaiting_approval`, and only the last decision returns
+   * it to `running`. No settle happens here — a decision is not a terminal transition.
+   */
+  function recordApproval(runId: string, instanceId: string, decision: { readonly requestId: string; readonly outcome: ApprovalOutcome }): boolean {
+    const at = now()
+    return inTransaction(database, () => {
+      const row = readRow(runId)
+      if (row === undefined || row.leaseOwner !== instanceId) return false
+      const chain = [...parseApprovals(row.approvalRefs)]
+      const index = chain.findIndex(item => item.requestId === decision.requestId && item.outcome === null)
+      const open = chain[index]
+      if (open === undefined) return false
+      chain[index] = { ...open, outcome: decision.outcome, decidedAt: at }
+      const status = chain.some(item => item.outcome === null) ? 'awaiting_approval' : 'running'
+      const result = db.prepare(`UPDATE Run SET status = ?, approvalRefs = ? WHERE id = ? AND status IN (${EXECUTING_STATUSES}) AND leaseOwner = ?`)
+        .run(status, JSON.stringify(chain), runId, instanceId)
+      return Number(result.changes) > 0
+    })
   }
 
   function finish(runId: string, instanceId: string, outcome: { readonly status: 'failed' | 'cancelled' | 'budget_exhausted'; readonly usage: TokenUsage | null; readonly errorRef?: string | null }): Run {
@@ -363,7 +454,7 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
     const at = now()
     return inTransaction(database, () => {
       const missionId = rowOrThrow(runId).missionId
-      const result = db.prepare(`UPDATE Run SET status = ?, usage = ?, errorRef = ?, endedAt = ? WHERE id = ? AND status = 'running' AND leaseOwner = ?`)
+      const result = db.prepare(`UPDATE Run SET status = ?, usage = ?, errorRef = ?, endedAt = ? WHERE id = ? AND status IN (${EXECUTING_STATUSES}) AND leaseOwner = ?`)
         .run(outcome.status, outcome.usage === null ? null : JSON.stringify(outcome.usage), outcome.errorRef ?? null, at, runId, instanceId)
       // Only the transaction that actually ended the Run charges the Mission.
       if (Number(result.changes) === 0) throw new SupersededError(runId, 'the Run is no longer running')
@@ -392,7 +483,7 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
       db.prepare(`INSERT INTO Outbox (id, deliverableId, channel, destinationRef, status, attemptCount, receiptRef, nextAttemptAt, createdAt, updatedAt)
         VALUES (?, ?, ?, NULL, 'pending', 0, NULL, NULL, ?, ?)`)
         .run(input.outboxId, input.deliverable.id, input.channel, at, at)
-      const result = db.prepare(`UPDATE Run SET status = 'succeeded', usage = ?, endedAt = ? WHERE id = ? AND status = 'running' AND leaseOwner = ?`)
+      const result = db.prepare(`UPDATE Run SET status = 'succeeded', usage = ?, endedAt = ? WHERE id = ? AND status IN (${EXECUTING_STATUSES}) AND leaseOwner = ?`)
         .run(input.usage === null ? null : JSON.stringify(input.usage), at, runId, instanceId)
       if (Number(result.changes) === 0) throw new SupersededError(runId, 'the Run stopped running before its deliverable was persisted')
       settle(missionId, input.usage === null ? null : JSON.stringify(input.usage))
@@ -444,10 +535,12 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
     enqueueDue,
     queuedIds: () => db.prepare("SELECT id FROM Run WHERE status = 'queued' ORDER BY createdAt, id").all<{ id: string }>().map(row => row.id),
     claim,
-    renew: (runId, instanceId, leaseMs) => Number(db.prepare(`UPDATE Run SET leaseUntil = ? WHERE id = ? AND status = 'running' AND leaseOwner = ?`).run(now() + leaseMs, runId, instanceId).changes) > 0,
-    attachSession: (runId, instanceId, sessionId) => Number(db.prepare(`UPDATE Run SET sessionId = ? WHERE id = ? AND status = 'running' AND leaseOwner = ?`).run(sessionId, runId, instanceId).changes) > 0,
+    renew: (runId, instanceId, leaseMs) => Number(db.prepare(`UPDATE Run SET leaseUntil = ? WHERE id = ? AND status IN (${EXECUTING_STATUSES}) AND leaseOwner = ?`).run(now() + leaseMs, runId, instanceId).changes) > 0,
+    attachSession: (runId, instanceId, sessionId) => Number(db.prepare(`UPDATE Run SET sessionId = ? WHERE id = ? AND status IN (${EXECUTING_STATUSES}) AND leaseOwner = ?`).run(sessionId, runId, instanceId).changes) > 0,
     committable,
     finish,
+    markAwaitingApproval,
+    recordApproval,
     recordUsage,
     commit,
     markSuperseded: (runId, instanceId) => inTransaction(database, () => supersedeRow(runId, instanceId, now()) > 0),
@@ -461,6 +554,32 @@ function parseRefs(json: string): readonly string[] {
   const parsed = JSON.parse(json) as unknown
   if (!Array.isArray(parsed)) throw new Error('icarus: stored ref list is not an array')
   return parsed.filter((item): item is string => typeof item === 'string')
+}
+
+/** Read the stored approval chain. A row written before 0002 holds the migration's `[]`. */
+function parseApprovals(json: string): readonly ApprovalRef[] {
+  const parsed = JSON.parse(json) as unknown
+  if (!Array.isArray(parsed)) throw new Error('icarus: stored approval chain is not an array')
+  return parsed.map(item => {
+    if (typeof item !== 'object' || item === null) throw new Error('icarus: stored approval entry is not an object')
+    const entry = item as Record<string, unknown>
+    const outcome = entry.outcome
+    if (outcome !== null && !APPROVAL_OUTCOMES.includes(outcome as ApprovalOutcome)) {
+      throw new Error(`icarus: stored approval entry has unknown outcome ${JSON.stringify(outcome)}`)
+    }
+    if (typeof entry.requestId !== 'string' || typeof entry.toolName !== 'string') {
+      throw new Error('icarus: stored approval entry is missing requestId or toolName')
+    }
+    return {
+      requestId: entry.requestId,
+      toolName: entry.toolName,
+      ...(typeof entry.callId === 'string' ? { callId: entry.callId } : {}),
+      ...(typeof entry.reason === 'string' ? { reason: entry.reason } : {}),
+      outcome: (outcome ?? null) as ApprovalOutcome | null,
+      askedAt: typeof entry.askedAt === 'number' ? entry.askedAt : 0,
+      decidedAt: typeof entry.decidedAt === 'number' ? entry.decidedAt : null,
+    }
+  })
 }
 
 function toRun(row: RunRow): Run {
@@ -477,6 +596,7 @@ function toRun(row: RunRow): Run {
     inputRefs: parseRefs(row.inputRefs),
     usage: row.usage === null ? null : (JSON.parse(row.usage) as TokenUsage),
     errorRef: row.errorRef,
+    approvalRefs: parseApprovals(row.approvalRefs),
     generation: row.generation,
     createdAt: row.createdAt,
     startedAt: row.startedAt,
