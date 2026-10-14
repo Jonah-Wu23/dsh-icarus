@@ -1,11 +1,16 @@
-// Icarus host plugin (M1).
+// Icarus host plugin (M1 BotBridge + M2.2 Mission domain).
 //
-// `apply` assembles BotBridge and registers the demonstration delivery. Resources are
-// registered through `ctx.effect`, so plugin unload aborts an in-flight demo instead of
-// leaving it behind. No host package is imported at run time: the plugin is installed
-// into the profile as a local path and resolves node built-ins only.
+// `apply` opens the Icarus database (migrations run on open), assembles the Mission
+// service and registers it as the `icarus` service, so a plugin declaring
+// `inject: ['icarus']` reads `ctx.icarus.missions`. Registrations go through
+// `ctx.provide`/`ctx.effect`, so unload disposes the service and closes the connection.
+// No host package is imported at run time: the plugin is installed as a local path and
+// resolves node built-ins only.
 import { runDigest } from './demo/digest.js'
 import { errorText } from './bridge/deliver.js'
+import { createIcarusDomain } from './domain/index.js'
+import { openDatabase } from './storage/index.js'
+import type { MissionService } from './domain/index.js'
 import type { IcarusContext } from './types/host.js'
 
 export const name = 'dsh-icarus'
@@ -14,7 +19,7 @@ export const inject = ['sessionController']
 export interface IcarusConfig {
   /** Bot id or name that receives deliveries; defaults to the Main Bot `Chief`. */
   readonly bot?: string | undefined
-  /** DSH home holding `bot/state.json`; defaults to `$DSH_HOME`, then `~/.dsh`. */
+  /** DSH home holding `bot/state.json` and `icarus/`; defaults to `$DSH_HOME`, then `~/.dsh`. */
   readonly dshHome?: string | undefined
   readonly demo?: DemoConfig | undefined
 }
@@ -24,6 +29,11 @@ export interface DemoConfig {
   readonly onBoot?: boolean | undefined
   /** Submissions per digest; defaults to 5. */
   readonly maxResults?: number | undefined
+}
+
+/** What the plugin publishes to the host as `ctx.icarus`. */
+export interface IcarusService {
+  readonly missions: MissionService
 }
 
 interface ResolvedDemoConfig {
@@ -39,7 +49,12 @@ interface ResolvedConfig {
 
 export function apply(ctx: IcarusContext, config: IcarusConfig = {}): void {
   const resolved = resolveConfig(config)
-  ctx.logger.info('icarus: loaded (bot=%s, demo.onBoot=%s)', resolved.bot, resolved.demo.onBoot)
+  const database = openDatabase({ dshHome: resolved.dshHome })
+  const domain = createIcarusDomain(database)
+  const service: IcarusService = { missions: domain.missions }
+  ctx.provide('icarus', service)
+  ctx.effect(() => () => domain.close(), 'icarus: storage')
+  ctx.logger.info('icarus: loaded (bot=%s, demo.onBoot=%s, schema=v%d, data=%s)', resolved.bot, resolved.demo.onBoot, database.schemaVersion, database.paths.dataDir)
   if (!resolved.demo.onBoot) return
   ctx.effect(() => {
     const controller = new AbortController()

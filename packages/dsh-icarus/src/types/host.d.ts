@@ -35,4 +35,10 @@ export interface IcarusContext {
   readonly logger: Logger
   readonly sessionController: SessionController
   effect(execute: () => (() => void) | void, label?: string): void
+  /**
+   * Register a service for other plugins under this fiber. Cordis owns the lifetime:
+   * the registration is disposed when the plugin unloads. Consumers reach it as
+   * `ctx.<name>` after declaring `inject: ['<name>']`.
+   */
+  provide(name: string, value: unknown): unknown
 }

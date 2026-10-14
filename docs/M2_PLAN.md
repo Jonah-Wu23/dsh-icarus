@@ -107,6 +107,13 @@ flowchart LR
 
 M2.4 依赖 M2.3 的执行器收口；M2.5 依赖 M2.3 的执行会话。M2.3 是最长路径。
 
+### 已确认的实现接缝（验收记录）
+
+- `Mission.kind` 落地为生命周期型（`once` / `recurring`），不是 PRD 的业务模板型（论文/申请/兴趣/investigate）。DB 对 kind 无 CHECK，M4 接三个模板与 investigate 时在域层扩类型或加 `template` 列（走新迁移），届时显式决策。
+- `ctx.icarus` 服务面：`ctx.provide('icarus', { missions })`，其他插件 `inject: ['icarus']` 取用；已用宿主 cordis 4.0.4 实测该机制成立。
+- 交付后状态入口为 `missions.recordDelivery(id)`；防重复交付靠 Outbox 状态，不靠状态机。
+- 代次校验用 `revision`，不用 `updatedAt`（pause/resume 也改 updatedAt）。
+
 ## 3. M2 总验收（联调，真实宿主）
 
 1. 通过 `ctx.icarus.missions` 创建一个长期委托（每日 21:00 Asia/Singapore 的假日报任务，预算有限），重启宿主后委托存在且 `nextDueAt` 正确。
