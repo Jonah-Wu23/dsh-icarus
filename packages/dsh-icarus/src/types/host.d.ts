@@ -33,7 +33,14 @@ export interface SessionCreateValue {
 }
 
 export interface SessionController {
-  prompt(request: SessionPromptRequest, signal?: AbortSignal | undefined): Promise<SessionPromptValue>
+  /**
+   * Admit one prompt. The signal is REQUIRED, not decorative: the host gateway calls
+   * `signal.throwIfAborted()` on it with no optional chain (0.2.0-rc.2
+   * `dsh-api-session-controller/lib/index.js`, `prompt(request, signal)`), so an omitted argument
+   * throws `TypeError: Cannot read properties of undefined (reading 'throwIfAborted')` before the
+   * prompt is ever admitted.
+   */
+  prompt(request: SessionPromptRequest, signal: AbortSignal): Promise<SessionPromptValue>
   /** Create or idempotently adopt one ordinary Session (0.2.0-rc.2 `sessionController.create`). */
   create(request: SessionCreateRequest): Promise<SessionCreateValue>
 }

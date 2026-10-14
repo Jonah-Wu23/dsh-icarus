@@ -17,7 +17,7 @@ import type { OutboxService } from './outbox.js'
 import type { RecoveryReport, RunListFilter, RunStore, RunView } from './runs.js'
 import type { Scheduler, TickReport } from './scheduler.js'
 
-export { DEFAULT_EXECUTION_TIMEOUT_MS, DEFAULT_LEASE_MS } from './executor.js'
+export { DEFAULT_ACCEPT_TIMEOUT_MS, DEFAULT_EXECUTION_TIMEOUT_MS, DEFAULT_LEASE_MS } from './executor.js'
 export { DELIVERY_TIMEOUT_MS, OUTBOX_CHANNEL_BOT, OutboxNotFoundError, RETRY_DELAY_MS, createOutboxService } from './outbox.js'
 export type { DeliveryAttempt, OutboxOptions, OutboxService, OutboxStatus } from './outbox.js'
 export { APPROVAL_OUTCOMES, RunNotFoundError, RUN_STATUSES, SupersededError, createRunStore, spentTokens } from './runs.js'

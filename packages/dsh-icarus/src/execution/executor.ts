@@ -5,6 +5,9 @@
 // requirement check → Deliverable + artifact + Outbox(pending) → delivery attempt →
 // `missions.recordDelivery`.
 //
+// The prompt carries an AbortSignal because the host gateway dereferences it unconditionally
+// (`signal.throwIfAborted()`); it bounds admission, and unload aborts it through `AbortSignal.any`.
+//
 // Only Sessions this executor created are observed: the event listener keys on the Session
 // id of a Run it started, so Bot chats and other plugins' Sessions never enter collection.
 // A turn that ends with a non-completed reason, or does not end within the timeout, fails the
@@ -27,6 +30,8 @@ import type { ApprovalOutcome, ApprovalRef, ApprovalRequest, Run, RunStore, Toke
 
 export const DEFAULT_LEASE_MS = 5 * 60_000
 export const DEFAULT_EXECUTION_TIMEOUT_MS = 10 * 60_000
+/** Bound on the host *admitting* a prompt; the turn itself is bounded by the execution timeout. */
+export const DEFAULT_ACCEPT_TIMEOUT_MS = 30_000
 export const DEFAULT_DELIVERY_MAX_CHARS = 4_000
 const MAX_EVIDENCE_LINKS = 20
 const MAX_TOOL_ERRORS = 20
@@ -60,6 +65,8 @@ export interface ExecutorOptions {
   readonly newId?: ((prefix: string) => string) | undefined
   readonly leaseMs?: number | undefined
   readonly timeoutMs?: number | undefined
+  /** Bound on the host admitting the prompt; defaults to 30 s (`DEFAULT_ACCEPT_TIMEOUT_MS`). */
+  readonly acceptTimeoutMs?: number | undefined
   readonly deliveryMaxChars?: number | undefined
 }
 
@@ -165,9 +172,12 @@ export function createExecutor(options: ExecutorOptions): Executor {
   const now = options.now ?? (() => Date.now())
   const newId = options.newId ?? mintId
   const timeoutMs = options.timeoutMs ?? DEFAULT_EXECUTION_TIMEOUT_MS
+  const acceptTimeoutMs = options.acceptTimeoutMs ?? DEFAULT_ACCEPT_TIMEOUT_MS
   const deliveryMaxChars = options.deliveryMaxChars ?? DEFAULT_DELIVERY_MAX_CHARS
   const { ctx, store, missions, paths } = options
   const turns = new Map<string, TurnTracker>()
+  /** Aborted on unload, so a prompt still being admitted does not outlive the plugin. */
+  const unloading = new AbortController()
   let disposed = false
 
   ctx.on('session/event', (session, event) => {
@@ -476,12 +486,16 @@ export function createExecutor(options: ExecutorOptions): Executor {
       turn = new TurnTracker(created.sessionId, runId)
       turns.set(created.sessionId, turn)
       const revision = snapshotOf(claimed.missionId, claimed.missionRevision)
+      // The second argument is required by the host gateway, which calls `signal.throwIfAborted()`
+      // on it with no optional chain — omitting it fails the Run before the prompt is admitted.
+      // The signal bounds admission only; the turn itself is bounded by `turn.armTimeout`.
+      const acceptSignal = AbortSignal.any([unloading.signal, AbortSignal.timeout(acceptTimeoutMs)])
       await ctx.sessionController.prompt({
         requestId: randomUUID(),
         sessionId: created.sessionId,
         mode: 'queue',
         content: [{ type: 'text', text: promptOf(revision, claimed) }],
-      })
+      }, acceptSignal)
       turn.armTimeout(timeoutMs)
       const end = await turn.done
       if (disposed || end.kind === 'abandoned') return { runId, status: 'abandoned', detail: 'the plugin unloaded while the turn was open' }
@@ -513,6 +527,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
     active: () => [...turns.values()].map(turn => turn.runId),
     dispose: () => {
       disposed = true
+      unloading.abort()
       for (const turn of turns.values()) turn.settle({ kind: 'abandoned' })
       turns.clear()
     },

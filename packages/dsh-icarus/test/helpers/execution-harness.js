@@ -93,9 +93,11 @@ export function createFakeHost(options = {}) {
   const intervals = []
   const provided = new Map()
   const effects = []
+  /** The AbortSignal each prompt was admitted with, in call order. */
+  const promptSignals = []
   let sequence = 0
 
-  const host = { prompts, created, logs, intervals, provided, effects }
+  const host = { prompts, created, logs, intervals, provided, effects, promptSignals }
   host.emit = (sessionId, event) => {
     for (const entry of listeners) entry.listener({ id: sessionId }, event)
   }
@@ -117,7 +119,15 @@ export function createFakeHost(options = {}) {
         sequence += 1
         return { sessionId: `session-run-${sequence}` }
       },
-      async prompt(request) {
+      async prompt(request, signal) {
+        // The real controller is the host gateway: it calls `signal.throwIfAborted()` on the
+        // second argument with no optional chain, so a caller that omits it must fail here too
+        // rather than pass in a stub that never reads it.
+        if (!(signal instanceof AbortSignal)) {
+          throw new TypeError('fake host: sessionController.prompt requires an AbortSignal as its second argument')
+        }
+        promptSignals.push(signal)
+        signal.throwIfAborted()
         prompts.push(request)
         return host.onPrompt(request, host)
       },

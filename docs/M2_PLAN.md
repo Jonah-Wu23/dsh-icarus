@@ -120,8 +120,11 @@ M2.4 依赖 M2.3 的执行器收口；M2.5 依赖 M2.3 的执行会话。M2.3 �
 - **`awaiting_approval` 是执行中状态，不是终态**：租约照常续（否则慢的人工答复必然租约过期、批准也无法提交）；`committable`/`finish`/`commit`/`recordUsage`/`attachSession`/`markSuperseded` 的状态条件统一放宽为 `status IN ('running','awaiting_approval')`。结算仍只由终态那一次条件 UPDATE 触发，挂起本身不结算；同一 turn 内可有多个未决请求，状态由链推导（还有 open 就保持 `awaiting_approval`，最后一条决定才回 `running`）。
 - **拒绝/取消/无应答都不杀 Run（D4 拍板）**：宿主拒绝只废那一次工具调用，回合照常 `completed`，一见 `rejected` 就判死会造成「turn 在跑、Run 已终态」的自残冲突，与 M2.4 超支同理。终局由 turn 收口 + 要求核对决定：核对通过 → 交付，交付文本必带「本次执行有 N 次审批未获通过：<工具>（<outcome>）」，绝不静默交付；核对不过 → `failed`，`runs/<id>/error.txt` 必含完整 asked/decided 配对（`requestId`/`toolName`/`callId`/`outcome`/两个时间戳）。
 - **错误档案固定结构（已落地）**：`runs/<id>/error.txt` = 头部（Run / Mission / revision / generation / 时间 / kind / detail / session / usage）+ 审批链（含仍 open 的请求）+ 工具错误（`tool/result` 的 `message` 与 `error.info`，按 callId 反查 `tool/call` 的名字）+ raw JSON（turn reason 原文；未捕获异常记 name、message 与前四行堆栈）。只有失败路径写这份档案，交付路径不碰它。
+- **`sessionController.prompt` 的第二参 signal 必传（联调打回修复）**：宿主 gateway 的 `prompt(request, signal)` 里是无条件 `signal.throwIfAborted()`（0.2.0-rc.2 `dsh-api-session-controller/lib/index.js:3096`），漏传会在受理前抛 `TypeError: Cannot read properties of undefined (reading 'throwIfAborted')`，Run 落 `failed / execution-error`。宿主自家 ds-bot 的传法是 `AbortSignal.timeout(30_000)`。现在两个调用点都传：`bridge/deliver.ts` 用投递超时，`execution/executor.ts` 用 `AbortSignal.any([unload, AbortSignal.timeout(30s)])` 只包受理阶段（回合由执行超时兜）。`types/host.d.ts` 把它标成必填，test harness 的 prompt 桩也断言第二参是 AbortSignal——这类「宿主签名必传参漏传」从此在 node:test 阶段就炸。
 
 ## 3. M2 总验收（联调，真实宿主）
+
+执行方式、逐步驱动脚本与检查点见 [M2_ACCEPTANCE_RUNBOOK.md](M2_ACCEPTANCE_RUNBOOK.md)；驱动插件在 `.work/m2-acceptance-driver/`（本地 harness，不进包）。
 
 1. 通过 `ctx.icarus.missions` 创建一个长期委托（每日 21:00 Asia/Singapore 的假日报任务，预算有限），重启宿主后委托存在且 `nextDueAt` 正确。
 2. 到期后产生 Run、真实执行会话跑一个最小任务、成果经 outbox 交付到绑定 Bot（Chief），Run 显示实际 token 用量。
