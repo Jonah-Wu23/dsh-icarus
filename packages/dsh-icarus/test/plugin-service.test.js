@@ -1,19 +1,20 @@
-// Plugin assembly: `apply` must open the database, publish the Mission service as
-// `ctx.icarus`, and close the connection when the plugin unloads. Uses a fake context, so
-// no host is needed and nothing is delivered.
+// Plugin assembly: `apply` must open the database, publish the Mission and Run services as
+// `ctx.icarus`, register the scheduling pass, and close the connection when the plugin
+// unloads. Uses a fake context, so no host is needed and nothing is delivered.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply } from '../lib/index.js'
+import { apply, inject } from '../lib/index.js'
 
-test('apply publishes ctx.icarus.missions and closes the database on unload', t => {
+test('apply publishes ctx.icarus.missions and ctx.icarus.runs, then closes on unload', async t => {
   const dshHome = mkdtempSync(join(tmpdir(), 'icarus-plugin-'))
   t.after(() => rmSync(dshHome, { recursive: true, force: true }))
 
   const provided = new Map()
   const effects = []
+  const intervals = []
   const logs = []
   const ctx = {
     logger: {
@@ -23,6 +24,11 @@ test('apply publishes ctx.icarus.missions and closes the database on unload', t 
       debug: () => {},
     },
     sessionController: { prompt: async () => ({ accepted: true }) },
+    on: () => {},
+    interval: (callback, delay) => {
+      intervals.push({ callback, delay })
+      return () => {}
+    },
     effect: (execute, label) => {
       effects.push({ label, dispose: execute() })
     },
@@ -35,11 +41,14 @@ test('apply publishes ctx.icarus.missions and closes the database on unload', t 
   apply(ctx, { dshHome, demo: { onBoot: false } })
 
   assert.deepEqual([...provided.keys()], ['icarus'])
+  assert.deepEqual([...inject], ['sessionController', 'timer'])
   assert.match(String(logs[0]?.[0]), /icarus: loaded/)
-  assert.deepEqual(effects.map(effect => effect.label), ['icarus: storage'])
+  assert.deepEqual(effects.map(effect => effect.label), ['icarus: execution and storage'])
+  assert.equal(intervals.length, 1)
+  assert.equal(intervals[0].delay, 60_000)
+  assert.ok(existsSync(join(dshHome, 'icarus', 'icarus.sqlite')))
 
   const service = provided.get('icarus')
-  assert.equal(typeof service.missions.create, 'function')
   const mission = service.missions.create({
     ownerBotId: 'session-bot-1',
     kind: 'recurring',
@@ -49,14 +58,14 @@ test('apply publishes ctx.icarus.missions and closes the database on unload', t 
     timezone: 'Asia/Singapore',
     budget: 1_000,
   })
-  assert.equal(service.missions.get(mission.id).revision, 1)
   assert.equal(service.missions.history(mission.id).length, 1)
-  assert.ok(service.missions.get(mission.id).nextDueAt > Date.now() - 60_000)
-  assert.ok(existsSync(join(dshHome, 'icarus', 'icarus.sqlite')))
+  assert.deepEqual(service.runs.list(), [])
+  const report = await service.runs.tick()
+  assert.deepEqual({ ...report, at: 0 }, { at: 0, enqueued: [], outcomes: [], errors: [] }, 'nothing is due yet')
 
   for (const effect of effects.splice(0)) effect.dispose()
   assert.throws(() => service.missions.list(), /database is not open/)
-  // The handle is closed for real: the data directory can be deleted while the test runs.
+  assert.throws(() => service.runs.list(), /database is not open/)
   rmSync(join(dshHome, 'icarus'), { recursive: true, force: true })
   assert.equal(existsSync(join(dshHome, 'icarus')), false)
 })

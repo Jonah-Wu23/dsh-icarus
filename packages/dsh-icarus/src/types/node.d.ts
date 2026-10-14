@@ -11,11 +11,14 @@ declare module 'node:fs' {
   export function mkdirSync(path: string, options?: { recursive?: boolean }): string | undefined
   export function existsSync(path: string): boolean
   export function statSync(path: string): { isFile(): boolean }
+  export function writeFileSync(path: string, data: string): void
+  export function readFileSync(path: string, encoding: 'utf8'): string
   export function rmSync(path: string, options?: { force?: boolean; recursive?: boolean }): void
 }
 
 declare module 'node:path' {
   export function join(...parts: string[]): string
+  export function dirname(path: string): string
   export function resolve(...parts: string[]): string
   export const sep: string
 }
@@ -26,7 +29,18 @@ declare module 'node:os' {
 
 declare module 'node:crypto' {
   export function randomUUID(): string
+  export interface Hash {
+    update(data: string): Hash
+    digest(encoding: 'hex'): string
+  }
+  export function createHash(algorithm: string): Hash
 }
+
+declare class TimerHandle {
+  private readonly brand: 'TimerHandle'
+}
+declare function setTimeout(callback: () => void, delay: number): TimerHandle
+declare function clearTimeout(handle: TimerHandle): void
 
 declare class AbortSignal {
   readonly aborted: boolean

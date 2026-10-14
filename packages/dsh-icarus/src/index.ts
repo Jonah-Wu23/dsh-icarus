@@ -1,20 +1,23 @@
-// Icarus host plugin (M1 BotBridge + M2.2 Mission domain).
+// Icarus host plugin (M1 BotBridge + M2.2 Mission domain + M2.3 execution lifecycle).
 //
-// `apply` opens the Icarus database (migrations run on open), assembles the Mission
-// service and registers it as the `icarus` service, so a plugin declaring
-// `inject: ['icarus']` reads `ctx.icarus.missions`. Registrations go through
-// `ctx.provide`/`ctx.effect`, so unload disposes the service and closes the connection.
-// No host package is imported at run time: the plugin is installed as a local path and
-// resolves node built-ins only.
+// `apply` opens the Icarus database (migrations run on open), assembles the Mission service
+// and the execution layer, and registers them as the `icarus` service: a plugin declaring
+// `inject: ['icarus']` reads `ctx.icarus.missions` and `ctx.icarus.runs`. Registrations go
+// through `ctx.provide`/`ctx.effect`/`ctx.interval`, so unload stops the scheduler, settles
+// in-flight executions and closes the connection. No host package is imported at run time:
+// the plugin is installed as a local path and resolves node built-ins only.
 import { runDigest } from './demo/digest.js'
 import { errorText } from './bridge/deliver.js'
 import { createIcarusDomain } from './domain/index.js'
+import { createExecution } from './execution/index.js'
 import { openDatabase } from './storage/index.js'
 import type { MissionService } from './domain/index.js'
+import type { RunService } from './execution/index.js'
 import type { IcarusContext } from './types/host.js'
 
 export const name = 'dsh-icarus'
-export const inject = ['sessionController']
+/** `sessionController` drives execution Sessions; `timer` supplies `ctx.interval`. */
+export const inject = ['sessionController', 'timer']
 
 export interface IcarusConfig {
   /** Bot id or name that receives deliveries; defaults to the Main Bot `Chief`. */
@@ -22,6 +25,7 @@ export interface IcarusConfig {
   /** DSH home holding `bot/state.json` and `icarus/`; defaults to `$DSH_HOME`, then `~/.dsh`. */
   readonly dshHome?: string | undefined
   readonly demo?: DemoConfig | undefined
+  readonly execution?: ExecutionConfig | undefined
 }
 
 export interface DemoConfig {
@@ -31,9 +35,34 @@ export interface DemoConfig {
   readonly maxResults?: number | undefined
 }
 
+export interface ExecutionConfig {
+  /** Scheduler, executor and startup recovery; defaults to true. */
+  readonly enabled?: boolean | undefined
+  /** Pass interval in milliseconds; defaults to 60000. */
+  readonly intervalMs?: number | undefined
+  /** Run lease length; renewed every pass; defaults to 300000. */
+  readonly leaseMs?: number | undefined
+  /** Wall-clock bound on one execution turn; defaults to 600000. */
+  readonly timeoutMs?: number | undefined
+  /** Bound on one delivery attempt; defaults to 30000. */
+  readonly deliveryTimeoutMs?: number | undefined
+  /** Runs executed per pass; defaults to 1 (M4 raises concurrency). */
+  readonly maxRunsPerTick?: number | undefined
+}
+
 /** What the plugin publishes to the host as `ctx.icarus`. */
 export interface IcarusService {
   readonly missions: MissionService
+  readonly runs: RunService
+}
+
+interface ResolvedExecutionConfig {
+  readonly enabled: boolean
+  readonly intervalMs: number
+  readonly leaseMs: number
+  readonly timeoutMs: number
+  readonly deliveryTimeoutMs: number
+  readonly maxRunsPerTick: number
 }
 
 interface ResolvedDemoConfig {
@@ -45,16 +74,44 @@ interface ResolvedConfig {
   readonly bot: string
   readonly dshHome: string | undefined
   readonly demo: ResolvedDemoConfig
+  readonly execution: ResolvedExecutionConfig
 }
 
 export function apply(ctx: IcarusContext, config: IcarusConfig = {}): void {
   const resolved = resolveConfig(config)
   const database = openDatabase({ dshHome: resolved.dshHome })
   const domain = createIcarusDomain(database)
-  const service: IcarusService = { missions: domain.missions }
+  const execution = createExecution({
+    ctx,
+    database,
+    missions: domain.missions,
+    bot: resolved.bot,
+    dshHome: resolved.dshHome,
+    enabled: resolved.execution.enabled,
+    tickMs: resolved.execution.intervalMs,
+    leaseMs: resolved.execution.leaseMs,
+    timeoutMs: resolved.execution.timeoutMs,
+    deliveryTimeoutMs: resolved.execution.deliveryTimeoutMs,
+    maxRunsPerTick: resolved.execution.maxRunsPerTick,
+  })
+  const service: IcarusService = { missions: domain.missions, runs: execution.runs }
   ctx.provide('icarus', service)
-  ctx.effect(() => () => domain.close(), 'icarus: storage')
-  ctx.logger.info('icarus: loaded (bot=%s, demo.onBoot=%s, schema=v%d, data=%s)', resolved.bot, resolved.demo.onBoot, database.schemaVersion, database.paths.dataDir)
+  ctx.effect(() => () => {
+    execution.dispose()
+    domain.close()
+  }, 'icarus: execution and storage')
+  execution.start()
+  ctx.logger.info(
+    'icarus: loaded (instance=%s, bot=%s, execution=%s, schema=v%d, data=%s)',
+    execution.instanceId,
+    resolved.bot,
+    resolved.execution.enabled ? `every ${resolved.execution.intervalMs}ms` : 'off',
+    database.schemaVersion,
+    database.paths.dataDir,
+  )
+  if (execution.recovery.superseded.length > 0) {
+    ctx.logger.warn('icarus: startup recovery superseded %d Run(s)', execution.recovery.superseded.length)
+  }
   if (!resolved.demo.onBoot) return
   ctx.effect(() => {
     const controller = new AbortController()
@@ -78,5 +135,24 @@ function resolveConfig(config: IcarusConfig): ResolvedConfig {
   if (typeof onBoot !== 'boolean') throw new TypeError('icarus: config.demo.onBoot must be a boolean')
   const maxResults = config.demo?.maxResults
   if (maxResults !== undefined && (!Number.isInteger(maxResults) || maxResults <= 0)) throw new TypeError('icarus: config.demo.maxResults must be a positive integer')
-  return { bot: bot.trim(), dshHome: config.dshHome, demo: { onBoot, maxResults } }
+  return { bot: bot.trim(), dshHome: config.dshHome, demo: { onBoot, maxResults }, execution: resolveExecution(config.execution) }
+}
+
+function resolveExecution(config: ExecutionConfig | undefined): ResolvedExecutionConfig {
+  const enabled = config?.enabled ?? true
+  if (typeof enabled !== 'boolean') throw new TypeError('icarus: config.execution.enabled must be a boolean')
+  return {
+    enabled,
+    intervalMs: positive(config?.intervalMs, 60_000, 'config.execution.intervalMs'),
+    leaseMs: positive(config?.leaseMs, 300_000, 'config.execution.leaseMs'),
+    timeoutMs: positive(config?.timeoutMs, 600_000, 'config.execution.timeoutMs'),
+    deliveryTimeoutMs: positive(config?.deliveryTimeoutMs, 30_000, 'config.execution.deliveryTimeoutMs'),
+    maxRunsPerTick: positive(config?.maxRunsPerTick, 1, 'config.execution.maxRunsPerTick'),
+  }
+}
+
+function positive(value: number | undefined, fallback: number, field: string): number {
+  if (value === undefined) return fallback
+  if (!Number.isInteger(value) || value <= 0) throw new TypeError(`icarus: ${field} must be a positive integer`)
+  return value
 }

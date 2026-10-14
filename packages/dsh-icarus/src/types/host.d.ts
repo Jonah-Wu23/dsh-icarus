@@ -20,8 +20,38 @@ export interface SessionPromptValue {
   readonly accepted: true
 }
 
+export interface SessionCreateRequest {
+  readonly workspaceId?: string | undefined
+  readonly cwd?: string | undefined
+  readonly sessionId?: string | undefined
+  readonly agentPreset?: string | undefined
+}
+
+export interface SessionCreateValue {
+  readonly sessionId: string
+  readonly agentPreset?: string | undefined
+}
+
 export interface SessionController {
   prompt(request: SessionPromptRequest, signal?: AbortSignal | undefined): Promise<SessionPromptValue>
+  /** Create or idempotently adopt one ordinary Session (0.2.0-rc.2 `sessionController.create`). */
+  create(request: SessionCreateRequest): Promise<SessionCreateValue>
+}
+
+/** The Session an event belongs to; only `id` is used. */
+export interface SessionLike {
+  readonly id?: string | undefined
+}
+
+/**
+ * One `session/event` record. `data` stays loose on purpose: the execution layer reads the
+ * few fields it needs (`message.content`, `usage`, `stream`, `reason`) through narrowing
+ * helpers, so a host that adds fields cannot break the plugin.
+ */
+export interface SessionEventLike {
+  readonly type: string
+  readonly time?: number | undefined
+  readonly data?: Record<string, unknown> | undefined
 }
 
 export interface Logger {
@@ -35,6 +65,10 @@ export interface IcarusContext {
   readonly logger: Logger
   readonly sessionController: SessionController
   effect(execute: () => (() => void) | void, label?: string): void
+  /** Session lifecycle events, including `turn/end` for Icarus-owned execution Sessions. */
+  on(event: 'session/event', listener: (session: SessionLike, event: SessionEventLike) => void): void
+  /** Repeating timer owned by this fiber (cordis-plugin-timer); disposed on unload. */
+  interval(callback: () => void, delay: number): () => void
   /**
    * Register a service for other plugins under this fiber. Cordis owns the lifetime:
    * the registration is disposed when the plugin unloads. Consumers reach it as

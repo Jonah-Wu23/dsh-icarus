@@ -1,0 +1,255 @@
+// Executor: the full Run flow with a fake host — Session creation, the prompt built from the
+// pinned revision, turn collection, the requirement check, the deliverable, the delivery and
+// the Mission status that follows.
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { existsSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { createExecution, createRunStore } from '../lib/execution/index.js'
+import { CHIEF_SESSION, NOW, assistantEvent, baseMission, completeTurn, goodResult, makeDue, openHarness, turnEndEvent } from './helpers/execution-harness.js'
+
+const USAGE = { inputTokens: 120, outputTokens: 45 }
+
+function executionOf(harness, options = {}) {
+  return createExecution({
+    ctx: harness.ctx,
+    database: harness.database,
+    missions: harness.missions,
+    bot: 'Chief',
+    dshHome: harness.dshHome,
+    now: harness.now,
+    deliveryTimeoutMs: 500,
+    ...options,
+  })
+}
+
+function artifactFile(harness, ref) {
+  return join(harness.dshHome, 'icarus', 'artifacts', ...ref.split('/'))
+}
+
+function deliveredPrompts(harness) {
+  return harness.host.prompts.filter(request => request.sessionId === CHIEF_SESSION)
+}
+
+test('a completed turn becomes a deliverable, an artifact, an outbox row and a Bot message', async t => {
+  const requirements = ['含来源引用']
+  const text = goodResult(requirements)
+  const harness = openHarness(t, { text, usage: USAGE })
+  const execution = executionOf(harness)
+  const mission = harness.missions.create(baseMission({ requirements }))
+  makeDue(harness.database, mission.id, harness.now())
+
+  const report = await execution.runs.tick()
+  assert.deepEqual(report.errors, [])
+  assert.equal(report.enqueued.length, 1)
+  assert.deepEqual(report.outcomes.map(outcome => outcome.status), ['succeeded'])
+
+  const run = execution.runs.get(report.enqueued[0])
+  assert.equal(run.status, 'succeeded')
+  assert.equal(run.sessionId, 'session-run-1')
+  assert.deepEqual({ ...run.usage }, USAGE)
+  assert.equal(run.endedAt, harness.now())
+  assert.equal(run.errorRef, null)
+  assert.equal(run.deliverables.length, 1)
+
+  const deliverable = run.deliverables[0]
+  assert.equal(deliverable.artifactRefs.length, 1)
+  const body = artifactFile(harness, deliverable.artifactRefs[0])
+  assert.ok(existsSync(body))
+  assert.equal(readFileSync(body, 'utf8'), text.trim())
+  assert.match(deliverable.content, /Icarus｜Run/)
+  assert.match(deliverable.content, /https:\/\/arxiv\.org\/abs\/2610\.00001/)
+  assert.equal(deliverable.contentHash.length, 64)
+  assert.deepEqual([...deliverable.evidenceRefs], ['https://arxiv.org/abs/2610.00001'])
+  assert.equal(deliverable.requirementResults.passed, true)
+  assert.deepEqual({ ...deliverable.outbox[0] }, {
+    id: deliverable.outbox[0].id,
+    deliverableId: deliverable.id,
+    channel: 'bot',
+    destinationRef: CHIEF_SESSION,
+    status: 'sent',
+    attemptCount: 1,
+    receiptRef: null,
+    nextAttemptAt: null,
+  })
+
+  const sent = deliveredPrompts(harness)
+  assert.equal(sent.length, 1)
+  assert.match(sent[0].content[0].text, /Icarus｜Run/)
+  assert.equal(harness.missions.get(mission.id).status, 'active', 'a recurring Mission stays active')
+  assert.equal(harness.missions.get(mission.id).revision, 1)
+})
+
+test('the execution Session runs in the workspace and is prompted with the pinned revision', async t => {
+  const harness = openHarness(t, { text: goodResult(['含来源引用']) })
+  const execution = executionOf(harness)
+  const mission = harness.missions.create(baseMission({ requirements: ['含来源引用'] }))
+  makeDue(harness.database, mission.id, harness.now())
+  await execution.runs.tick()
+
+  assert.deepEqual({ ...harness.host.created[0] }, { cwd: join(harness.dshHome, 'icarus', 'workspace') })
+  const prompt = harness.host.prompts[0]
+  assert.equal(prompt.mode, 'queue')
+  assert.match(prompt.requestId, /^[0-9a-f-]{36}$/)
+  assert.match(prompt.content[0].text, /委托目标：arXiv cs.AI 每日摘要/)
+  assert.match(prompt.content[0].text, /1\. 含来源引用/)
+  assert.match(prompt.content[0].text, /## <要求原文>/)
+  assert.match(prompt.content[0].text, /Asia\/Singapore/)
+})
+
+test('a once Mission completes after a confirmed delivery', async t => {
+  const harness = openHarness(t, { text: goodResult(['含来源引用']), usage: USAGE })
+  const execution = executionOf(harness)
+  const mission = harness.missions.create(baseMission({ kind: 'once', schedule: { kind: 'once', at: NOW + 1_000 } }))
+  harness.clock.at += 1_000
+
+  const report = await execution.runs.tick()
+  assert.deepEqual(report.outcomes.map(outcome => outcome.status), ['succeeded'])
+  assert.equal(harness.missions.get(mission.id).status, 'completed')
+  assert.equal(harness.missions.get(mission.id).nextDueAt, null)
+  assert.equal(execution.runs.get(report.enqueued[0]).usage.outputTokens, 45)
+})
+
+test('a result that fails the requirement check fails the Run and keeps the raw text', async t => {
+  const harness = openHarness(t, { text: '太短了。' })
+  const execution = executionOf(harness)
+  const mission = harness.missions.create(baseMission())
+  makeDue(harness.database, mission.id, harness.now())
+
+  const report = await execution.runs.tick()
+  assert.equal(report.outcomes[0].status, 'failed')
+  assert.match(report.outcomes[0].detail, /R2 length floor/)
+  const run = execution.runs.get(report.enqueued[0])
+  assert.equal(run.status, 'failed')
+  assert.equal(run.deliverables.length, 0)
+  const raw = readFileSync(artifactFile(harness, run.errorRef), 'utf8')
+  assert.match(raw, /kind: requirement-check/)
+  assert.match(raw, /R3 source marker/)
+  assert.match(raw, /太短了。/)
+  assert.equal(harness.database.db.prepare('SELECT COUNT(*) AS n FROM Outbox').get().n, 0)
+  assert.equal(deliveredPrompts(harness).length, 0)
+  assert.equal(harness.missions.get(mission.id).status, 'active')
+})
+
+test('a turn error fails the Run with the host failure preserved raw', async t => {
+  const harness = openHarness(t, {
+    onPrompt: async (request, host) => {
+      queueMicrotask(() => host.emit(request.sessionId, turnEndEvent({
+        kind: 'error',
+        error: { message: 'provider exploded', code: 'llm/error', status: 503, requestId: 'req-9' },
+      })))
+      return { accepted: true }
+    },
+  })
+  const execution = executionOf(harness)
+  const mission = harness.missions.create(baseMission())
+  makeDue(harness.database, mission.id, harness.now())
+
+  const report = await execution.runs.tick()
+  assert.equal(report.outcomes[0].status, 'failed')
+  const run = execution.runs.get(report.enqueued[0])
+  const raw = readFileSync(artifactFile(harness, run.errorRef), 'utf8')
+  assert.match(raw, /kind: turn-error/)
+  assert.match(raw, /provider exploded/)
+  assert.match(raw, /"code": "llm\/error"/)
+  assert.match(raw, /"status": 503/)
+  assert.match(raw, /"requestId": "req-9"/)
+})
+
+test('a turn that never ends fails the Run on the execution timeout', async t => {
+  const harness = openHarness(t, { onPrompt: async () => ({ accepted: true }) })
+  const execution = executionOf(harness, { timeoutMs: 40 })
+  const mission = harness.missions.create(baseMission())
+  makeDue(harness.database, mission.id, harness.now())
+
+  const report = await execution.runs.tick()
+  assert.equal(report.outcomes[0].status, 'failed')
+  assert.match(report.outcomes[0].detail, /no turn\/end within 40 ms/)
+  const run = execution.runs.get(report.enqueued[0])
+  assert.match(readFileSync(artifactFile(harness, run.errorRef), 'utf8'), /kind: turn-timeout/)
+})
+
+test('events from Sessions this executor did not create are ignored', async t => {
+  const requirements = ['含来源引用']
+  const text = goodResult(requirements)
+  const harness = openHarness(t, {
+    onPrompt: async (request, host) => {
+      queueMicrotask(() => {
+        completeTurn(host, 'session-other', '外部会话的文本不应该进入成果。'.repeat(20))
+        host.emit(request.sessionId, assistantEvent('这一段属于我们的执行会话。'))
+        completeTurn(host, request.sessionId, text, USAGE)
+      })
+      return { accepted: true }
+    },
+  })
+  const execution = executionOf(harness)
+  const mission = harness.missions.create(baseMission({ requirements }))
+  makeDue(harness.database, mission.id, harness.now())
+  await execution.runs.tick()
+
+  const run = execution.runs.list({ missionId: mission.id })[0]
+  const body = readFileSync(artifactFile(harness, run.deliverables[0].artifactRefs[0]), 'utf8')
+  assert.equal(body, `这一段属于我们的执行会话。\n\n${text}`.trim())
+  assert.equal(body.includes('外部会话的文本'), false)
+})
+
+test('a Mission modified while the Run is in flight supersedes it and rejects the result', async t => {
+  const harness = openHarness(t, {
+    onPrompt: async (request, host) => {
+      queueMicrotask(() => {
+        harness.missions.modify(mission.id, { objective: '第二版目标' })
+        completeTurn(host, request.sessionId, goodResult(['含来源引用']))
+      })
+      return { accepted: true }
+    },
+  })
+  const execution = executionOf(harness)
+  const mission = harness.missions.create(baseMission())
+  makeDue(harness.database, mission.id, harness.now())
+
+  const report = await execution.runs.tick()
+  assert.deepEqual(report.outcomes.map(outcome => outcome.status), ['superseded'])
+  assert.match(harness.host.prompts[0].content[0].text, /委托目标：arXiv cs.AI 每日摘要/, 'the prompt keeps the pinned revision')
+  const run = execution.runs.get(report.enqueued[0])
+  assert.equal(run.status, 'superseded')
+  assert.equal(run.deliverables.length, 0)
+  assert.equal(run.errorRef, null)
+  assert.equal(harness.database.db.prepare('SELECT COUNT(*) AS n FROM Deliverable').get().n, 0)
+  assert.equal(harness.missions.get(mission.id).revision, 2)
+})
+
+test('a Mission cancelled while the Run is in flight leaves the result undelivered', async t => {
+  const harness = openHarness(t, {
+    onPrompt: async (request, host) => {
+      queueMicrotask(() => {
+        harness.missions.cancel(mission.id)
+        completeTurn(host, request.sessionId, goodResult(['含来源引用']))
+      })
+      return { accepted: true }
+    },
+  })
+  const execution = executionOf(harness)
+  const mission = harness.missions.create(baseMission())
+  makeDue(harness.database, mission.id, harness.now())
+
+  const report = await execution.runs.tick()
+  assert.deepEqual(report.outcomes.map(outcome => outcome.status), ['cancelled'])
+  const run = execution.runs.get(report.enqueued[0])
+  assert.equal(run.status, 'cancelled')
+  assert.equal(run.deliverables.length, 0)
+  assert.equal(deliveredPrompts(harness).length, 0)
+  assert.equal(harness.missions.get(mission.id).status, 'cancelled')
+})
+
+test('a Run left queued by a previous process is claimed by the next pass', async t => {
+  const harness = openHarness(t, { text: goodResult(['含来源引用']) })
+  const store = createRunStore(harness.database, { missions: harness.missions, now: harness.now })
+  const mission = harness.missions.create(baseMission())
+  makeDue(harness.database, mission.id, harness.now())
+  const queued = store.enqueueDue(mission.id)
+
+  const execution = executionOf(harness)
+  const report = await execution.runs.tick()
+  assert.deepEqual(report.outcomes.map(outcome => outcome.runId), [queued.id])
+  assert.equal(execution.runs.get(queued.id).status, 'succeeded')
+})
