@@ -28,6 +28,13 @@ export interface Mission {
   readonly authorizationRef: string | null
   readonly budgetUsed: number
   readonly nextDueAt: number | null
+  /**
+   * True when nothing will ever run this Mission again: a `once` Mission that is still `active`
+   * with no due time, no Run in flight and no delivered result. `modify` re-arms exactly this
+   * state; the flag exists so the state is never silent in between. A Mission whose occurrence is
+   * simply running right now is not flagged.
+   */
+  readonly awaitingReschedule: boolean
   readonly createdAt: number
   readonly updatedAt: number
 }

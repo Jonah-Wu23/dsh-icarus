@@ -6,6 +6,14 @@
 // matching snapshot. Status changes (pause/resume/cancel/delivered) are runtime state and
 // never create a revision. Ids come from the domain layer, timestamps from the caller's
 // clock so tests and restarts stay reproducible.
+//
+// A `once` Mission has exactly one occurrence: `enqueueDue` consumes its due time and clears it,
+// and a delivery completes the Mission. If that one occurrence ends without delivering — the Run
+// failed, was superseded, or the gate refused it — nothing else would ever run the Mission, so
+// `modify` re-arms it (a new once instant) instead of leaving it `active` and inert. Re-arming
+// hangs off the EDIT path, never off the failure path: a retry triggered by failure would turn a
+// quota or transport error into a retry loop. `Mission.awaitingReschedule` exposes the state that
+// is still waiting for that edit.
 import { MissionNotFoundError, MissionStateError } from './errors.js'
 import { newId } from './ids.js'
 import { assertKindSchedule, assertTransition, isMissionKind, isMissionStatus, transitionOnDelivered } from './mission.js'
@@ -67,6 +75,12 @@ export interface MissionServiceOptions {
   readonly newId?: ((prefix: string) => string) | undefined
 }
 
+/** How far ahead a re-armed `once` Mission fires: far enough to survive the edit's own pass. */
+export const RESCHEDULE_DELAY_MS = 5_000
+
+/** Run statuses that mean "this Mission is being worked on right now". */
+const IN_FLIGHT_RUN_STATUSES = ['queued', 'running', 'awaiting_approval'] as const
+
 interface MissionRow {
   readonly id: string
   readonly ownerBotId: string
@@ -123,10 +137,40 @@ export function createMissionService(database: IcarusDatabase, options: MissionS
   const now = options.now ?? (() => Date.now())
   const mintId = options.newId ?? newId
 
+  /** Mission ids holding at least one Run in one of `statuses`; one query for a whole batch. */
+  function missionIdsWithRun(ids: readonly string[], statuses: readonly string[]): Set<string> {
+    if (ids.length === 0) return new Set()
+    const missionSlots = ids.map(() => '?').join(', ')
+    const statusSlots = statuses.map(() => '?').join(', ')
+    const rows = database.db
+      .prepare(`SELECT DISTINCT missionId FROM Run WHERE missionId IN (${missionSlots}) AND status IN (${statusSlots})`)
+      .all<{ missionId: string }>(...ids, ...statuses)
+    return new Set(rows.map(row => row.missionId))
+  }
+
+  /** Mission ids that already produced a Deliverable; one query for a whole batch. */
+  function missionIdsWithDeliverable(ids: readonly string[]): Set<string> {
+    if (ids.length === 0) return new Set()
+    const missionSlots = ids.map(() => '?').join(', ')
+    const rows = database.db
+      .prepare(`SELECT DISTINCT Run.missionId AS missionId FROM Deliverable JOIN Run ON Run.id = Deliverable.runId
+        WHERE Run.missionId IN (${missionSlots})`)
+      .all<{ missionId: string }>(...ids)
+    return new Set(rows.map(row => row.missionId))
+  }
+
+  /** The rows that are `active` with nothing left that could ever run them again. */
+  function rescheduleFlags(rows: readonly MissionRow[]): Set<string> {
+    const ids = rows.map(row => row.id)
+    const inFlight = missionIdsWithRun(ids, IN_FLIGHT_RUN_STATUSES)
+    const delivered = missionIdsWithDeliverable(ids)
+    return new Set(rows.filter(row => needsReschedule(row, inFlight.has(row.id), delivered.has(row.id))).map(row => row.id))
+  }
+
   function get(id: string): Mission {
     const row = database.db.prepare(`SELECT ${MISSION_COLUMNS} FROM Mission WHERE id = ?`).get<MissionRow>(id)
     if (row === undefined) throw new MissionNotFoundError(id)
-    return toMission(row)
+    return toMission(row, rescheduleFlags([row]).has(id))
   }
 
   function list(filter: MissionListFilter = {}): Mission[] {
@@ -147,7 +191,9 @@ export function createMissionService(database: IcarusDatabase, options: MissionS
       params.push(filter.kind)
     }
     const where = clauses.length === 0 ? '' : ` WHERE ${clauses.join(' AND ')}`
-    return database.db.prepare(`SELECT ${MISSION_COLUMNS} FROM Mission${where} ORDER BY createdAt, id`).all<MissionRow>(...params).map(toMission)
+    const rows = database.db.prepare(`SELECT ${MISSION_COLUMNS} FROM Mission${where} ORDER BY createdAt, id`).all<MissionRow>(...params)
+    const waiting = rescheduleFlags(rows)
+    return rows.map(row => toMission(row, waiting.has(row.id)))
   }
 
   function create(input: CreateMissionInput): Mission {
@@ -191,11 +237,19 @@ export function createMissionService(database: IcarusDatabase, options: MissionS
     const at = now()
     // Only a timing change moves nextDueAt; an overdue `once` Mission keeps its instant so
     // the scheduler still sees it as due.
-    const dueAt = patch.schedule === undefined && patch.timezone === undefined
+    const patchedDueAt = patch.schedule === undefined && patch.timezone === undefined
       ? current.nextDueAt
       : nextDueAt(schedule, timezone, at)
+    // A `once` Mission whose one occurrence is already consumed and which never delivered has no
+    // other way back, so this edit re-arms it. An occurrence in flight is fine: this revision bump
+    // supersedes that Run anyway, and the re-armed instant is what runs the new revision.
+    const rearm = patchedDueAt === null && kind === 'once' && current.status === 'active'
+      && !missionIdsWithDeliverable([id]).has(id)
+    const rearmedAt = at + RESCHEDULE_DELAY_MS
+    const dueAt = rearm ? rearmedAt : patchedDueAt
+    const storedSchedule: Schedule = rearm ? { kind: 'once', at: rearmedAt } : schedule
     const requirementsJson = JSON.stringify(requirements)
-    const scheduleJson = JSON.stringify(schedule)
+    const scheduleJson = JSON.stringify(storedSchedule)
     inTransaction(database, () => {
       database.db.prepare(`UPDATE Mission SET kind = ?, objective = ?, requirements = ?, schedule = ?, timezone = ?,
         budget = ?, authorizationRef = ?, revision = revision + 1, nextDueAt = ?, updatedAt = ? WHERE id = ?`)
@@ -255,7 +309,7 @@ export function createMissionService(database: IcarusDatabase, options: MissionS
   }
 }
 
-function toMission(row: MissionRow): Mission {
+function toMission(row: MissionRow, awaitingReschedule: boolean): Mission {
   if (!isMissionKind(row.kind)) throw new MissionStateError(`Mission ${JSON.stringify(row.id)} has unknown kind ${JSON.stringify(row.kind)}`)
   if (!isMissionStatus(row.status)) throw new MissionStateError(`Mission ${JSON.stringify(row.id)} has unknown status ${JSON.stringify(row.status)}`)
   return {
@@ -272,9 +326,15 @@ function toMission(row: MissionRow): Mission {
     authorizationRef: row.authorizationRef,
     budgetUsed: row.budgetUsed,
     nextDueAt: row.nextDueAt,
+    awaitingReschedule,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   }
+}
+
+/** The view invariant: `active`, nothing due, nothing running, nothing delivered — a dead end. */
+function needsReschedule(row: MissionRow, inFlight: boolean, delivered: boolean): boolean {
+  return row.kind === 'once' && row.status === 'active' && row.nextDueAt === null && !inFlight && !delivered
 }
 
 function nonEmptyString(value: unknown, field: string): string {

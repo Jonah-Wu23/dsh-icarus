@@ -61,7 +61,7 @@ test('apply publishes ctx.icarus.missions and ctx.icarus.runs, then closes on un
   assert.equal(service.missions.history(mission.id).length, 1)
   assert.deepEqual(service.runs.list(), [])
   const report = await service.runs.tick()
-  assert.deepEqual({ ...report, at: 0 }, { at: 0, enqueued: [], outcomes: [], errors: [] }, 'nothing is due yet')
+  assert.deepEqual({ ...report, at: 0 }, { at: 0, enqueued: [], outcomes: [], recovered: { superseded: [], requeued: [] }, errors: [] }, 'nothing is due yet')
 
   for (const effect of effects.splice(0)) effect.dispose()
   assert.throws(() => service.missions.list(), /database is not open/)

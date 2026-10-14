@@ -116,12 +116,19 @@ interface ToolErrorRecord {
 /**
  * One execution turn: the assistant text and usage it produced, the tool errors it hit, and how
  * it ended. Approvals are not mirrored here — the store's chain is their single source of truth.
+ *
+ * Text is kept per segment, not as one running blob: a tool-using turn narrates between calls
+ * ("now I'll write the file"), and that narration is not the deliverable. `resultText` returns
+ * what arrived after the LAST tool result — the closing answer — or the last message of a turn
+ * that called no tool at all.
  */
 class TurnTracker {
   readonly texts: string[] = []
   readonly toolErrors: ToolErrorRecord[] = []
   /** Tool names by call id, so a tool error can name the tool it came from. */
   readonly callNames = new Map<string, string>()
+  /** How many assistant texts had arrived when the last tool result landed; -1 before any. */
+  private lastToolResultAt = -1
   usage: TokenUsage | null = null
   private settled = false
   private timer: TimerHandle | undefined
@@ -139,6 +146,22 @@ class TurnTracker {
   /** Bound what a runaway turn can put into the failure archive. */
   remember(error: ToolErrorRecord): void {
     if (this.toolErrors.length < MAX_TOOL_ERRORS) this.toolErrors.push(error)
+  }
+
+  /** Record one assistant text, in order. */
+  say(text: string): void {
+    this.texts.push(text)
+  }
+
+  /** Note that a tool result arrived: everything said so far is working narration. */
+  sawToolResult(): void {
+    this.lastToolResultAt = this.texts.length
+  }
+
+  /** The deliverable candidate: the segment after the last tool result, else the last message. */
+  resultText(): string {
+    const segment = this.lastToolResultAt < 0 ? this.texts.slice(-1) : this.texts.slice(this.lastToolResultAt)
+    return segment.join('\n\n').trim()
   }
 
   settle(end: TurnEnd): void {
@@ -187,7 +210,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
     if (turn === undefined) return
     if (event.type === 'assistant/message') {
       const text = textOfMessage(event)
-      if (text !== '') turn.texts.push(text)
+      if (text !== '') turn.say(text)
       const usage = usageOfEvent(event)
       if (usage !== null) {
         turn.usage = addUsage(turn.usage, usage)
@@ -209,6 +232,8 @@ export function createExecutor(options: ExecutorOptions): Executor {
       return
     }
     if (event.type === 'tool/result') {
+      // Any tool result ends a narration segment: what follows it is the closing answer.
+      turn.sawToolResult()
       // A rejected or timed-out tool call lands here as an error result; it is the raw material
       // the failure archive keeps, because the approval event itself carries no error detail.
       const failure = toolErrorOf(event, turn)
@@ -415,7 +440,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
   }
 
   async function complete(run: Run, turn: TurnTracker, gate: BudgetState): Promise<ExecutionOutcome> {
-    const text = turn.texts.join('\n\n').trim()
+    const text = turn.resultText()
     if (missions.get(run.missionId).status === 'cancelled') {
       store.finish(run.id, options.instanceId, { status: 'cancelled', usage: turn.usage, errorRef: null })
       return { runId: run.id, status: 'cancelled', detail: 'the Mission was cancelled while the Run was in flight' }

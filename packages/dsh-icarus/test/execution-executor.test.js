@@ -6,7 +6,7 @@ import assert from 'node:assert/strict'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createExecution, createRunStore } from '../lib/execution/index.js'
-import { CHIEF_SESSION, NOW, assistantEvent, baseMission, completeTurn, goodResult, makeDue, openHarness, turnEndEvent } from './helpers/execution-harness.js'
+import { CHIEF_SESSION, NOW, assistantEvent, baseMission, completeTurn, goodResult, makeDue, openHarness, toolCallEvent, toolResultEvent, turnEndEvent } from './helpers/execution-harness.js'
 
 const USAGE = { inputTokens: 120, outputTokens: 45 }
 
@@ -176,7 +176,8 @@ test('events from Sessions this executor did not create are ignored', async t =>
     onPrompt: async (request, host) => {
       queueMicrotask(() => {
         completeTurn(host, 'session-other', '外部会话的文本不应该进入成果。'.repeat(20))
-        host.emit(request.sessionId, assistantEvent('这一段属于我们的执行会话。'))
+        host.emit(request.sessionId, toolCallEvent('call-1', 'web_search'))
+        host.emit(request.sessionId, toolResultEvent('call-1'))
         completeTurn(host, request.sessionId, text, USAGE)
       })
       return { accepted: true }
@@ -189,8 +190,64 @@ test('events from Sessions this executor did not create are ignored', async t =>
 
   const run = execution.runs.list({ missionId: mission.id })[0]
   const body = readFileSync(artifactFile(harness, run.deliverables[0].artifactRefs[0]), 'utf8')
-  assert.equal(body, `这一段属于我们的执行会话。\n\n${text}`.trim())
+  assert.equal(body, text.trim())
   assert.equal(body.includes('外部会话的文本'), false)
+})
+
+test('the deliverable is the closing answer, not the narration between tool calls', async t => {
+  const requirements = ['含来源引用']
+  const text = goodResult(requirements)
+  const harness = openHarness(t, {
+    onPrompt: async (request, host) => {
+      queueMicrotask(() => {
+        host.emit(request.sessionId, assistantEvent('作者信息已补齐，现在把完整摘要落盘并输出。'))
+        host.emit(request.sessionId, toolCallEvent('call-1', 'write_file'))
+        host.emit(request.sessionId, toolResultEvent('call-1', 'written'))
+        host.emit(request.sessionId, assistantEvent('落盘完成，接着核一下来源。'))
+        host.emit(request.sessionId, toolCallEvent('call-2', 'web_search'))
+        host.emit(request.sessionId, toolResultEvent('call-2', 'ok'))
+        host.emit(request.sessionId, assistantEvent(text, USAGE))
+        host.emit(request.sessionId, turnEndEvent({ kind: 'completed' }))
+      })
+      return { accepted: true }
+    },
+  })
+  const execution = executionOf(harness)
+  const mission = harness.missions.create(baseMission({ requirements }))
+  makeDue(harness.database, mission.id, harness.now())
+
+  const report = await execution.runs.tick()
+  assert.deepEqual(report.outcomes.map(outcome => outcome.status), ['succeeded'])
+  const run = execution.runs.get(report.enqueued[0])
+  const body = readFileSync(artifactFile(harness, run.deliverables[0].artifactRefs[0]), 'utf8')
+  assert.equal(body, text.trim(), 'only the segment after the last tool result is the deliverable')
+  assert.equal(body.includes('作者信息已补齐'), false)
+  assert.equal(body.includes('落盘完成'), false)
+})
+
+test('a turn with no tool call keeps its last assistant message, not every one of them', async t => {
+  const text = goodResult(['含来源引用'])
+  const harness = openHarness(t, {
+    onPrompt: async (request, host) => {
+      queueMicrotask(() => {
+        host.emit(request.sessionId, assistantEvent('先想一下怎么写。'))
+        host.emit(request.sessionId, assistantEvent('再补一句过渡。'))
+        host.emit(request.sessionId, assistantEvent(text, USAGE))
+        host.emit(request.sessionId, turnEndEvent({ kind: 'completed' }))
+      })
+      return { accepted: true }
+    },
+  })
+  const execution = executionOf(harness)
+  const mission = harness.missions.create(baseMission({ requirements: ['含来源引用'] }))
+  makeDue(harness.database, mission.id, harness.now())
+
+  const report = await execution.runs.tick()
+  assert.deepEqual(report.outcomes.map(outcome => outcome.status), ['succeeded'])
+  const run = execution.runs.get(report.enqueued[0])
+  const body = readFileSync(artifactFile(harness, run.deliverables[0].artifactRefs[0]), 'utf8')
+  assert.equal(body, text.trim())
+  assert.deepEqual({ ...run.usage }, USAGE, 'usage still accumulates across every assistant message')
 })
 
 test('a Mission modified while the Run is in flight supersedes it and rejects the result', async t => {

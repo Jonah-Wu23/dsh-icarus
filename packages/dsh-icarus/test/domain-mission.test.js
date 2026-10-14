@@ -11,6 +11,7 @@ import {
   MissionNotFoundError,
   MissionStateError,
   MISSION_STATUSES,
+  RESCHEDULE_DELAY_MS,
   canTransition,
   createMissionService,
 } from '../lib/domain/index.js'
@@ -206,4 +207,75 @@ test('a failing snapshot write rolls create and modify back completely', t => {
   const row = database.db.prepare('SELECT objective, revision FROM Mission WHERE id = ?').get('mission_seed')
   assert.deepEqual({ ...row }, { objective: 'seed', revision: 1 }, 'the revision bump must roll back with the snapshot')
   assert.deepEqual(missions.list().map(mission => mission.objective), ['seed'])
+})
+
+// A `once` Mission has one occurrence. When that occurrence is consumed without delivering, the
+// Mission is `active` with nothing due — a dead end the view must show and `modify` must reopen.
+function consumeDueTime(database, missionId) {
+  database.db.prepare('UPDATE Mission SET nextDueAt = NULL WHERE id = ?').run(missionId)
+}
+
+function onceMission(missions, overrides = {}) {
+  return missions.create(baseMission({ kind: 'once', schedule: { kind: 'once', at: NOW + 60_000 }, ...overrides }))
+}
+
+test('modify re-arms a consumed once Mission and the snapshot carries the new instant', t => {
+  const { database, missions } = openDomain(t)
+  const created = onceMission(missions)
+  consumeDueTime(database, created.id)
+
+  assert.equal(missions.get(created.id).awaitingReschedule, true, 'the dead end is visible before the edit')
+
+  const rearmed = missions.modify(created.id, { objective: '换个目标再来一次' })
+  assert.equal(rearmed.revision, 2)
+  assert.equal(rearmed.nextDueAt, NOW + RESCHEDULE_DELAY_MS)
+  assert.deepEqual(rearmed.schedule, { kind: 'once', at: NOW + RESCHEDULE_DELAY_MS })
+  assert.equal(rearmed.awaitingReschedule, false)
+  assert.deepEqual(missions.history(created.id)[1].schedule, { kind: 'once', at: NOW + RESCHEDULE_DELAY_MS })
+})
+
+test('a recurring Mission is never re-armed: its own next occurrence is the retry', t => {
+  const { database, missions } = openDomain(t)
+  const created = missions.create(baseMission())
+  const kept = created.nextDueAt
+  consumeDueTime(database, created.id)
+
+  const modified = missions.modify(created.id, { objective: '改一下' })
+  assert.equal(modified.nextDueAt, null)
+  assert.equal(missions.get(created.id).awaitingReschedule, false, 'the flag is about once Missions only')
+  assert.equal(kept, Date.parse('2026-10-14T13:00:00.000Z'))
+})
+
+test('a once Mission whose Run is still in flight is not waiting for a reschedule', t => {
+  const { database, missions } = openDomain(t)
+  const created = onceMission(missions)
+  consumeDueTime(database, created.id)
+  database.db.prepare(`INSERT INTO Run (id, missionId, missionRevision, status, inputRefs, approvalRefs, generation, createdAt)
+    VALUES ('run_live', ?, 1, 'running', '[]', '[]', 1, ?)`).run(created.id, NOW)
+
+  assert.equal(missions.get(created.id).awaitingReschedule, false)
+})
+
+test('a once Mission that already delivered is not re-armed by an edit', t => {
+  const { database, missions } = openDomain(t)
+  const created = onceMission(missions)
+  consumeDueTime(database, created.id)
+  database.db.prepare(`INSERT INTO Run (id, missionId, missionRevision, status, inputRefs, approvalRefs, generation, createdAt)
+    VALUES ('run_done', ?, 1, 'succeeded', '[]', '[]', 1, ?)`).run(created.id, NOW)
+  database.db.prepare(`INSERT INTO Deliverable (id, runId, requirementResults, evidenceRefs, artifactRefs, content, contentHash, createdAt)
+    VALUES ('del_done', 'run_done', '{}', '[]', '[]', '成果', 'hash', ?)`).run(NOW)
+
+  assert.equal(missions.get(created.id).awaitingReschedule, false)
+  const edited = missions.modify(created.id, { objective: '改了也不该重跑' })
+  assert.equal(edited.nextDueAt, null, 'a delivered result is never delivered twice')
+})
+
+test('a once Mission that already delivered but is still active is listed as not waiting', t => {
+  const { database, missions } = openDomain(t)
+  const created = onceMission(missions)
+  consumeDueTime(database, created.id)
+  database.db.prepare(`INSERT INTO Run (id, missionId, missionRevision, status, inputRefs, approvalRefs, generation, createdAt)
+    VALUES ('run_partial', ?, 1, 'failed', '[]', '[]', 1, ?)`).run(created.id, NOW)
+
+  assert.deepEqual(missions.list({ kind: 'once' }).map(mission => mission.awaitingReschedule), [true])
 })

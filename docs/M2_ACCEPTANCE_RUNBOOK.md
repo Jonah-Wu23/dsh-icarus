@@ -7,7 +7,7 @@
 
 ## 1. 前置（一次性）
 
-1. 构建与测试：`cd E:\AI\dsh-icarus\packages\dsh-icarus; pnpm build; pnpm test` → 85 pass / 0 fail。
+1. 构建与测试：`cd E:\AI\dsh-icarus\packages\dsh-icarus; pnpm build; pnpm test` → 全绿（验收当天 87 pass / 0 fail；收尾补丁后 97）。
 2. **完全退出桌面 DSH**（`dsh plugin` 要独占 profile）。
 3. Icarus 的启动演示已在 `C:\Users\JonahWu\.dsh\profiles\desktop\cordis.patch.yml` 里常驻关闭，免得验收期被 arXiv 交付刷屏；同一行还把执行租约压到 1 分钟，供步骤 2 的重启存续验证使用：
    ```yaml
@@ -59,7 +59,7 @@
 | 2 | 重启存续 | `{"step":"verify-persist"}` | `pass`（重启后逐字相同） |
 | 3 | 到期真实执行 | `{"step":"due-run"}` | `pass`，`run.status=succeeded`，`run.usage` 有 input/output |
 | 4 | 在途改委托 | `{"step":"supersede"}` | `pass`，`inFlightRun.status=superseded`，`nextRun.missionRevision=2`，`missionAtNextRun.status=active` |
-| 4b | 单次委托边界（可选） | `{"step":"superseded-once"}` | `finding`，`neverRan=true` |
+| 4b | 单次委托重排 | `{"step":"superseded-once"}` | `pass`，旧 Run `superseded` 且 `mission.nextDueAt` 重新被设上 |
 | 5 | 预算闸门 | `{"step":"budget-zero"}` | `pass`，`run.status=budget_exhausted`，`run.sessionId=null` |
 | 6 | 单次委托交付 | `{"step":"once-completed"}` | `pass`，`mission.status=completed` |
 | 7 | 审批同意 | `{"step":"approval-grant"}` | `pass`，`approvals=[allowed-once]` |
@@ -89,9 +89,24 @@
 
 ## 6. 发现与边界
 
-- **发现（待裁定）**：`once` 委托在途被修改 → 在途 Run 被 `superseded`，但 `once` 没有下一次到期，`nextDueAt` 为 `null`、Mission 停在 `active`，新 revision 永不执行。证据：驱动 selftest 的 `superseded-once`（`mission.status=active`、`nextDueAt=null`、只有 1 个 revision 1 的 superseded Run）。建议修法：supersede 之后若 Mission 仍 `active` 且 `nextDueAt` 为 `null` 或已过，补一个当前 revision 的 queued Run——与 `claim()` 处理过期 Run 的分支同款。属 M2.3 语义，需负责人决定是并入 M2 总验收修掉还是记入 M3 前置。
+- **`once` 委托的死角（总验收发现，已裁定并修复）**：`once` 委托的唯一一次 Run 被 supersede、失败、或被预算闸门拒绝后，Mission 停在 `active` 且 `nextDueAt = null`——既不完成，也不会再执行。裁定：**`modify` 重新排期**，不引入 `retry` 动作；重排挂在**编辑路径**而不是失败路径，免得配额/传输类失败变成失败-重试热循环；视图用 `Mission.awaitingReschedule` 把「还没被编辑的死角」显式标出来。修复见 M2_PLAN §1 的收尾补丁条目。
+- **`recoverExpired()` 只在加载时跑**（总验收发现，已修复）：宿主在租约窗口内重启时，加载那一次 recovery 会跳过还没过期的 Run，随后没有归属的 `running` Run 一直挂到下次重启。现在 recovery 并入每个 pass（先续租、再 healing、再排队），租约本身成为唯一栅栏。验证重启存续时仍要等过 `leaseUntil`，否则结论里要说明跳过的原因。
 - 驱动插件是本地 harness，不进包、不写 Icarus 的数据库结构，只用 `ctx.icarus` 的公开服务面。
 - 执行超时默认 10 分钟：人工审批拖过这个时间会走 `approval-timeout`（fail-closed），验收时别把弹窗挂着不管。
+- 总验收期间观察到的宿主行为（与 Icarus 无关）见附录 C。
+
+## 附录 C 宿主行为观察（M2 总验收，2026-10-15）
+
+都不是 Icarus 缺陷，是宿主环境/路由的事实，复现或排查时先看这里：
+
+1. **审批卡片只在所属执行会话里可见**。执行会话在 `$DSH_HOME/icarus/workspace` 下自建，卡片渲染在它自己的界面里；用户停留在别的会话时看不到卡片。要答审批，先在会话列表打开那个执行会话。
+2. **沙箱升级的拒绝原文**是 `the user rejected escalating this command to "<mode>"`（`dsh-sandbox` 抛错路径），不是工具级 `ask` 的 `the user rejected tool "<name>"`；两种组合在 `tool errors` 段里的文案不同，判定时按实际原文核。
+3. **审批策略是会话级 + 日志持久**：GUI 改预设走 `permissionPresets.set(session, name)`，只往该会话日志追加 `approval/policy`；新建会话在 `pinInitialPermission` 里按 settings 的 `defaultPreset` 钉定。所以聊天会话里切到 `never` 不影响之后新建的执行会话；要复现审批路径，先确认默认预设还是 `workspace-write`/`read-only`（`ask`）。
+4. **权限策略 `never` 的语义**不是「不弹卡片」而是服务在派发前直接返回 `rejected`，因此链里会是 `outcome: rejected`；若链为空，说明请求根本没有发出——两者写法不同，别混。
+5. **环境侧的两次失败都被档案原样记下**：Kimi 周配额 403（`turn-error / code: AUTH`）与一次 DeepSeek transport 抖动（`code: TRANSPORT`）；换默认模型后继续，与 Icarus 无关。
+6. **审批挂起会持续续租**：实测等待 5m27s（§6）与 24s（§7）两轮中 `leaseUntil` 一直跟着走，`awaiting_approval` 不会被自己的租约过期杀掉——这条是 M2.5 挂起语义在真实宿主里的正面证据。
+
+判定用的两条硬证据也记在这里：同意路径看「探针文件在 `decidedAt` 之后被写入」（实测晚 0.3–0.6 秒）；拒绝路径要么用**事前不存在**的新文件名看「文件没出现」，要么比对 mtime 确认**没被改写**——§6 留下的同名文件会让「被拦住」变成假阳性。
 
 ## 7. 验收后回滚
 

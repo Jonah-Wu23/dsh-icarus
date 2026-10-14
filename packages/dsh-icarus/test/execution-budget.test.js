@@ -217,8 +217,10 @@ test('a Run mid-flight records partial usage so its settle is complete', async t
     onPrompt: async (request, host) => {
       if (request.sessionId.startsWith('session-run-')) {
         queueMicrotask(() => {
-          host.emit(request.sessionId, assistantEvent(goodResult(['含来源引用']), { inputTokens: 20, outputTokens: 5 }))
-          host.emit(request.sessionId, assistantEvent('这是同一轮里的第二次用量记录。', { inputTokens: 30, outputTokens: 15 }))
+          // The second message is the closing answer: text collection keeps only what follows
+          // the last tool result, so a narration-first turn still delivers the real result.
+          host.emit(request.sessionId, assistantEvent('先把这一轮的进度说一下。', { inputTokens: 20, outputTokens: 5 }))
+          host.emit(request.sessionId, assistantEvent(goodResult(['含来源引用']), { inputTokens: 30, outputTokens: 15 }))
           host.emit(request.sessionId, turnEndEvent({ kind: 'completed' }))
         })
       }

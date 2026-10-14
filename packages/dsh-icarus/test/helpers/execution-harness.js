@@ -67,6 +67,25 @@ export function toolErrorEvent(callId, text, info) {
   }
 }
 
+/** `tool/result` for a successful call: it closes the narration segment before the answer. */
+export function toolResultEvent(callId, text = 'ok') {
+  return {
+    type: 'tool/result',
+    time: 0,
+    data: {
+      turn: 1,
+      step: 1,
+      message: {
+        role: 'tool',
+        source: { kind: 'tool', callId },
+        toolCallId: callId,
+        content: [{ type: 'text', text }],
+        isError: false,
+      },
+    },
+  }
+}
+
 /** The Run id an execution Session belongs to, as the plugin recorded it. */
 export function runIdOfSession(harness, sessionId) {
   return harness.database.db.prepare('SELECT id FROM Run WHERE sessionId = ?').get(sessionId).id

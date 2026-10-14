@@ -1,10 +1,14 @@
-// Scheduler: the due-time scan, the queue drain and startup recovery.
+// Scheduler: the due-time scan, the queue drain and recovery.
 //
-// One pass (`tick`) does three things: renew the lease of every Run this instance is
-// executing, enqueue a Run for each Mission whose due time has arrived, then claim and
-// execute queued Runs. Enqueue and claim each happen inside their own transaction, so a
-// crash between them loses at most a wake-up: the Run row either exists once or not at all,
-// and `UNIQUE (missionId, generation)` refuses a duplicate.
+// One pass (`tick`) does four things: renew the lease of every Run this instance is executing,
+// heal Runs whose owner is gone, enqueue a Run for each Mission whose due time has arrived, then
+// claim and execute queued Runs. Enqueue and claim each happen inside their own transaction, so a
+// crash between them loses at most a wake-up: the Run row either exists once or not at all, and
+// `UNIQUE (missionId, generation)` refuses a duplicate.
+//
+// Recovery runs on every pass, not only at load. The lease is the fence, so healing on each pass
+// is what makes it the real one: a host that restarts inside the lease window leaves an unowned
+// `running` Run whose lease expires a minute later, and nothing else would ever look at it again.
 //
 // M2.3 executes serially (`maxRunsPerTick`, default 1). Concurrency and its budget belong to
 // M4; the guard in the interval callback keeps two passes from overlapping.
@@ -34,12 +38,14 @@ export interface TickReport {
   /** Run ids created by this pass. */
   readonly enqueued: readonly string[]
   readonly outcomes: readonly ExecutionOutcome[]
+  /** Expired-lease Runs this pass superseded, and the fresh Runs it queued for them. */
+  readonly recovered: RecoveryReport
   /** Failures of the pass itself, already logged. */
   readonly errors: readonly string[]
 }
 
 export interface Scheduler {
-  /** One pass: renew leases, enqueue due Missions, execute queued Runs. */
+  /** One pass: renew leases, heal expired ones, enqueue due Missions, execute queued Runs. */
   tick(): Promise<TickReport>
   /** Renew the lease of every Run this instance is executing. */
   renewLeases(): void
@@ -70,12 +76,23 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
       .map(row => row.id)
   }
 
+  function runRecovery(): RecoveryReport {
+    const report = store.recoverExpired()
+    if (report.superseded.length > 0) {
+      logger.warn('icarus: recovery superseded %d Run(s) with an expired lease and re-queued %d', report.superseded.length, report.requeued.length)
+    }
+    return report
+  }
+
   async function tick(): Promise<TickReport> {
     const at = now()
     const enqueued: string[] = []
     const outcomes: ExecutionOutcome[] = []
     const errors: string[] = []
+    // Renewal first: this instance's own live Runs keep their lease, so the recovery that follows
+    // cannot take a Run away from an executor that is still working on it.
     renewLeases()
+    const recovered = runRecovery()
 
     for (const missionId of dueMissionIds()) {
       try {
@@ -107,18 +124,12 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
         logger.error('icarus: %s', message)
       }
     }
-    return { at, enqueued, outcomes, errors }
+    return { at, enqueued, outcomes, recovered, errors }
   }
 
   return {
     tick,
     renewLeases,
-    recover: () => {
-      const report = store.recoverExpired()
-      if (report.superseded.length > 0) {
-        logger.warn('icarus: recovery superseded %d Run(s) with an expired lease and re-queued %d', report.superseded.length, report.requeued.length)
-      }
-      return report
-    },
+    recover: runRecovery,
   }
 }
