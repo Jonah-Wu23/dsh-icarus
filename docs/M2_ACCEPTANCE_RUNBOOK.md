@@ -87,13 +87,16 @@
 5. **单次/循环状态**：步骤 6 的 `mission.status=completed`；步骤 3/4 的 Mission 交付后仍 `active`。
 6. **GUI 审批两条路**：步骤 7 链里 `allowed-once`；步骤 8 链里 `rejected` 且 `delivery[0].content` 含「审批未获通过」。若第 8 步的 Run 判 `failed`，`failureArchive.text` 必须含完整 asked/decided 配对（`requestId`/`tool`/`callId`/`outcome`/两个时间）。
 
-## 6. 发现与边界
+## 6. 请求预算与恢复检查
 
-- **`once` 委托的死角（总验收发现，已裁定并修复）**：`once` 委托的唯一一次 Run 被 supersede、失败、或被预算闸门拒绝后，Mission 停在 `active` 且 `nextDueAt = null`——既不完成，也不会再执行。裁定：**`modify` 重新排期**，不引入 `retry` 动作；重排挂在**编辑路径**而不是失败路径，免得配额/传输类失败变成失败-重试热循环；视图用 `Mission.awaitingReschedule` 把「还没被编辑的死角」显式标出来。修复见 M2_PLAN §1 的收尾补丁条目。
-- **`recoverExpired()` 只在加载时跑**（总验收发现，已修复）：宿主在租约窗口内重启时，加载那一次 recovery 会跳过还没过期的 Run，随后没有归属的 `running` Run 一直挂到下次重启。现在 recovery 并入每个 pass（先续租、再 healing、再排队），租约本身成为唯一栅栏。验证重启存续时仍要等过 `leaseUntil`，否则结论里要说明跳过的原因。
-- 驱动插件是本地 harness，不进包、不写 Icarus 的数据库结构，只用 `ctx.icarus` 的公开服务面。
-- 执行超时默认 10 分钟：人工审批拖过这个时间会走 `approval-timeout`（fail-closed），验收时别把弹窗挂着不管。
-- 总验收期间观察到的宿主行为（与 Icarus 无关）见附录 C。
+- `once` 执行失败或预算耗尽后保持 `active`，通过 `awaitingReschedule` 显示等待重新排期。编辑会生成新 revision 并重新排期；恢复已暂停的单次委托也会为尚未交付的工作重新安排执行。
+- 请求前检查 `ModelCall` 预留。正预算不足以容纳完整输入及最大输出时，Run 为 `budget_exhausted`，模型请求数为零；回合中预算不足时，下一次请求停止，保留实际用量及进展。
+- 将 `execution.userTokenBudget` 设为零，确认用户总预算同样阻止模型请求。恢复正常配置后，核对执行与标题调用的费用；Bot 完整阅读交付后，其调用也计入同一 Mission。
+- 对宿主已完成、Run 尚未提交的真实回合重启宿主。租约过期后扫描应提交同一 Run 的原成果，执行模型请求数保持原值。中断回合保存用量后登记新的执行代次。
+- 同时调用两次 `runs.tick()` 应共享同一条扫描。已暂停的队列不能被领取，取消会终止其等待状态；同一 Mission 不并发启动两次执行。
+- 发送前保存未确认状态。`sent` 不重发，`delivery_unknown` 不自动重发；来源及接收会话可核查后再决定下一项动作。
+- 执行超时默认 10 分钟，通过宿主取消仍在运行的回合，错误档案保留审批链及实际进展。租约按不超过其时长三分之一的间隔续期。
+- 驱动属于本地联调用具，不随插件分发。实际验收使用桌面 `0.2.0-rc.2` 的运行时与真实模型，标准构建及现有测试通过后再检查上述场景。
 
 ## 附录 C 宿主行为观察（M2 总验收，2026-10-15）
 
@@ -108,14 +111,10 @@
 
 判定用的两条硬证据也记在这里：同意路径看「探针文件在 `decidedAt` 之后被写入」（实测晚 0.3–0.6 秒）；拒绝路径要么用**事前不存在**的新文件名看「文件没出现」，要么比对 mtime 确认**没被改写**——§6 留下的同名文件会让「被拦住」变成假阳性。
 
-## 7. 验收后回滚
+## 7. 验收后清理
 
 ```powershell
 dsh plugin --profile desktop remove dsh-icarus-acceptance
 dsh plugin --profile desktop install
 ```
-再把前置第 4 步改动的 `permission.defaultPreset` 改回原样（icarus 行的演示关闭与租约设置常驻，不动），删除 `.work\m2-acceptance\` 与 `.work\m2-acceptance-driver\`。
-
-## 8. 驱动自身的验证
-
-`node E:\AI\dsh-icarus\.work\m2-acceptance-driver\driver-selftest.mjs` —— 在宿主自带的 Cordis 构建里挂真实 Icarus 插件 + 假 sessionController，逐个跑全部步骤并断言证据字段。它证明驱动与检查点成立；真实模型、GUI 与权限预设仍由本 runbook 的人工步骤负责。
+将前置第 4 步的权限预设恢复为验收前的配置。原始联调记录保留在 Git 忽略的目录中。

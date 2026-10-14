@@ -33,6 +33,7 @@ export interface SessionCreateValue {
 }
 
 export interface SessionController {
+  cancel(request: { readonly sessionId: string }): { readonly accepted: true }
   /**
    * Admit one prompt. The signal is REQUIRED, not decorative: the host gateway calls
    * `signal.throwIfAborted()` on it with no optional chain (0.2.0-rc.2
@@ -69,11 +70,28 @@ export interface Logger {
 }
 
 export interface IcarusContext {
+  readonly agents: {
+    get(id: string): { cancel(cause: { readonly kind: 'user' }, options: { readonly keepInbox: true }): void } | undefined
+  }
   readonly logger: Logger
   readonly sessionController: SessionController
   effect(execute: () => (() => void) | void, label?: string): void
   /** Session lifecycle events, including `turn/end` for Icarus-owned execution Sessions. */
   on(event: 'session/event', listener: (session: SessionLike, event: SessionEventLike) => void): void
+  on(event: 'llm/stream', listener: (request: ModelRequest, next: () => AsyncIterable<ModelChunk>) => AsyncIterable<ModelChunk>): void
+  on(event: 'agent/request', listener: (request: { readonly agent: { readonly session: { readonly id: string } } }, next: () => Promise<Record<string, unknown>>) => Promise<Record<string, unknown>>): void
+  on(event: 'tools/execute', listener: (request: { readonly agent?: { readonly session: { readonly id: string } } }, next: () => Promise<unknown>) => Promise<unknown>): void
+  readonly llm: {
+    stream(request: ModelRequest): AsyncIterable<ModelChunk>
+    resolveModelInfo(provider: string, model: string): Promise<{ readonly contextWindow?: number }>
+  }
+  readonly sessions: { get(id: string): { readonly header: { readonly parentSession?: string }; snapshotEvents(): readonly SessionEventLike[] } | undefined }
+  readonly sessionQuery: {
+    observeSession(id: string, options: { readonly projectionMode: 'none' }): Promise<{
+      readonly events: readonly SessionEventLike[]
+      [Symbol.dispose](): void
+    }>
+  }
   /** Repeating timer owned by this fiber (cordis-plugin-timer); disposed on unload. */
   interval(callback: () => void, delay: number): () => void
   /**
@@ -82,4 +100,19 @@ export interface IcarusContext {
    * `ctx.<name>` after declaring `inject: ['<name>']`.
    */
   provide(name: string, value: unknown): unknown
+}
+
+export interface ModelRequest {
+  readonly sessionId?: string
+  readonly purpose?: string
+  readonly maxTokens?: number
+  readonly signal?: AbortSignal
+  readonly messages?: readonly { readonly role: string; readonly source?: { readonly rpcId?: string }; readonly content: readonly unknown[] }[]
+  readonly [key: string]: unknown
+}
+
+export interface ModelChunk {
+  readonly type: string
+  readonly usage?: { readonly inputTokens: number; readonly outputTokens: number; readonly [key: string]: unknown }
+  readonly [key: string]: unknown
 }

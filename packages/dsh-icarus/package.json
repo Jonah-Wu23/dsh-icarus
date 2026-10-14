@@ -16,7 +16,7 @@
   ],
   "meta": {
     "title": "Icarus",
-    "description": "持续委托与证据化策展（M1：BotBridge 与演示交付）"
+    "description": "持续委托、预算管理与后台成果交付"
   },
   "scripts": {
     "build": "tsc",
@@ -26,11 +26,15 @@
     "@deepseek-ai/cordis": "*"
   },
   "devDependencies": {
+    "@types/markdown-it": "^14.2.0",
     "typescript": "^5.9.3"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
+  },
+  "dependencies": {
+    "markdown-it": "^15.0.2"
   }
 }

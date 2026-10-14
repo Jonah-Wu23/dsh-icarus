@@ -7,4 +7,4 @@
       config:
         bot: Chief
         demo:
-          onBoot: true
+          onBoot: false

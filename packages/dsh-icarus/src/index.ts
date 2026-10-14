@@ -9,7 +9,7 @@
 import { runDigest } from './demo/digest.js'
 import { errorText } from './bridge/deliver.js'
 import { createIcarusDomain } from './domain/index.js'
-import { createExecution } from './execution/index.js'
+import { DEFAULT_MAX_OUTPUT_TOKENS, createExecution } from './execution/index.js'
 import { openDatabase } from './storage/index.js'
 import type { MissionService } from './domain/index.js'
 import type { RunService } from './execution/index.js'
@@ -17,7 +17,7 @@ import type { IcarusContext } from './types/host.js'
 
 export const name = 'dsh-icarus'
 /** `sessionController` drives execution Sessions; `timer` supplies `ctx.interval`. */
-export const inject = ['sessionController', 'timer']
+export const inject = ['sessionController', 'timer', 'llm', 'sessions', 'sessionQuery', 'agents']
 
 export interface IcarusConfig {
   /** Bot id or name that receives deliveries; defaults to the Main Bot `Chief`. */
@@ -36,6 +36,8 @@ export interface DemoConfig {
 }
 
 export interface ExecutionConfig {
+  readonly maxOutputTokens?: number
+  readonly userTokenBudget?: number | null
   /** Scheduler, executor and startup recovery; defaults to true. */
   readonly enabled?: boolean | undefined
   /** Pass interval in milliseconds; defaults to 60000. */
@@ -57,6 +59,8 @@ export interface IcarusService {
 }
 
 interface ResolvedExecutionConfig {
+  readonly maxOutputTokens: number
+  readonly userTokenBudget: number | null
   readonly enabled: boolean
   readonly intervalMs: number
   readonly leaseMs: number
@@ -93,11 +97,13 @@ export function apply(ctx: IcarusContext, config: IcarusConfig = {}): void {
     timeoutMs: resolved.execution.timeoutMs,
     deliveryTimeoutMs: resolved.execution.deliveryTimeoutMs,
     maxRunsPerTick: resolved.execution.maxRunsPerTick,
+    maxOutputTokens: resolved.execution.maxOutputTokens,
+    userTokenBudget: resolved.execution.userTokenBudget,
   })
   const service: IcarusService = { missions: domain.missions, runs: execution.runs }
   ctx.provide('icarus', service)
-  ctx.effect(() => () => {
-    execution.dispose()
+  ctx.effect(() => async () => {
+    await execution.dispose()
     domain.close()
   }, 'icarus: execution and storage')
   execution.start()
@@ -143,12 +149,20 @@ function resolveExecution(config: ExecutionConfig | undefined): ResolvedExecutio
   if (typeof enabled !== 'boolean') throw new TypeError('icarus: config.execution.enabled must be a boolean')
   return {
     enabled,
+    maxOutputTokens: positive(config?.maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 'config.execution.maxOutputTokens'),
+    userTokenBudget: tokenBudget(config?.userTokenBudget),
     intervalMs: positive(config?.intervalMs, 60_000, 'config.execution.intervalMs'),
     leaseMs: positive(config?.leaseMs, 300_000, 'config.execution.leaseMs'),
     timeoutMs: positive(config?.timeoutMs, 600_000, 'config.execution.timeoutMs'),
     deliveryTimeoutMs: positive(config?.deliveryTimeoutMs, 30_000, 'config.execution.deliveryTimeoutMs'),
     maxRunsPerTick: positive(config?.maxRunsPerTick, 1, 'config.execution.maxRunsPerTick'),
   }
+}
+
+function tokenBudget(value: number | null | undefined): number | null {
+  if (value === undefined || value === null) return null
+  if (!Number.isSafeInteger(value) || value < 0) throw new TypeError('icarus: config.execution.userTokenBudget must be a non-negative integer or null')
+  return value
 }
 
 function positive(value: number | undefined, fallback: number, field: string): number {

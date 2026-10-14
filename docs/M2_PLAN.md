@@ -58,13 +58,13 @@ M2.1 存储地基 ──> M2.2 Mission 域服务 ──> M2.3 执行生命周期
 
 任务：
 - 调度器：每 60s（`ctx.interval`）扫 `nextDueAt <= now AND status='active'` 的 Mission，事务内创建 `Run(queued)` 并把 `nextDueAt` 推进到下一周期——崩溃也只丢一次唤醒，不重复建 Run（唯一约束兜底）。
-- 租约与代次：领取 = 事务内 `queued → running` + 写 `leaseOwner(实例 id)/leaseUntil/generation`。`generation` 取自 Mission 当前 revision 与全局代次计数；**提交成果前校验 Run 仍是 running、租约未过期、generation 与 Mission 当前 revision 一致**，否则提交拒绝并转 `superseded`。过期执行者不能提交新结果。
+- 租约与代次：事务内将 `queued` 领取为 `running`，保存实例及租约。`generation` 在每个 Mission 内递增，`missionRevision` 固定该次执行采用的定义。提交前校验执行状态、租约所有者与有效期，并核对当前 revision；过期执行者不能提交新结果。
 - 执行器：为 Run 创建执行会话（`sessionController.create`，cwd=`$DSH_HOME/icarus/workspace`），装载 Mission 当前 objective/requirements 为任务 prompt，`prompt` 驱动；监听 `session/event` 至 `turn/end`：
   - completed → 收 `assistant/message` 文本为候选成果；
   - error → `failed`，保留原始错误（code/status/requestId）入 `errorRef`；
   - 中途宿主重启 → 重启恢复逻辑见下。
 - 要求核对：Run 结束前按 `requirements` 逐条核对候选成果（M2 用程序可判的结构核对：非空、含来源引用标记、长度下限；语义判断留 M3 起交给模型），核对过 → 持久化 `Deliverable` + artifacts 文件 → `Outbox(pending)` → BotBridge 交付 → 成功回执（prompt 无错返回）→ `sent`；prompt 超时无法确认 → `delivery_unknown`；核对不过 → `failed` 并保留原因。
-- 重启恢复：插件加载时扫 `running/awaiting_approval` 的 Run：租约已过期 → 按「旧执行」处理转 `superseded` 并重新排队（新 generation）；`queued` 直接由调度器再领取。**旧版本成果提交走同一条代次校验**，统一在状态转换里拒绝。
+- 重启恢复：启动及后续扫描读取租约过期 Run 的宿主会话。已完成回合在重新领取租约后提交原成果；中断回合保留实际用量，再登记新 generation。`queued` 由调度器领取。旧版本成果提交遵守同一条 revision 与租约校验。
 - Run 查询：`ctx.icarus.runs`（get/list by mission/状态、含 usage 与成果引用）。
 
 验收（对应 DEVELOPMENT_PLAN 完成依据）：
@@ -77,17 +77,17 @@ M2.1 存储地基 ──> M2.2 Mission 域服务 ──> M2.3 执行生命周期
 
 任务：
 - Mission `budget`：token 硬上限（input+output 合计），价格未知时只展示 token 用量（PRD §8.3）。
-- 预留/结算：Run 启动前按配置估算上限做预留（`budgetReserved`），执行中从 `session/event` 的 usage 事件累计实际用量，Run 结束按实际结算（`usage` 字段落库）。**结算点收在执行器收口处**：M3 起采集解释、反馈整理、重跑的每一次模型调用都必须经由执行器发起，否则不予计量、不予放行。
+- 预留/结算：每次 `llm/stream` 请求前，按完整输入与最大输出保存 `ModelCall` 预留。调用结束按真实 usage 结算到 Mission；Run 保存调用总用量。标题、压缩与交付阅读等辅助调用共用预算，工具发起的关联调用携带同一委托的归属。
 - 上限闸门：预留超过 Mission 剩余预算 → Run 直接 `budget_exhausted`，不发起任何模型调用；结算后更新 Mission 累计用量。
 - 用量查询并入 `ctx.icarus.runs` 返回。
 
-验收：预算为 0 的 Mission 到期产生 `budget_exhausted` 的 Run 且零模型调用；node:test 覆盖预留/结算/超额闸门。
+验收：预算为 0 时不建立执行会话；预算不足以预留时零模型请求；真实回合中剩余额度不足会阻止下一次请求。Mission 的总用量包含交付后的 Bot 阅读，用户总预算同样阻止新增请求。
 
 ### M2.5 审批绑定与错误档案
 
 任务：
 - 审批记录：监听执行会话日志中的 `approval/asked`/`approval/decided`，把 requestId、动作、结果绑定到 `Run.id` + `missionId` + `missionRevision` 落 `Run.approvalRefs`。宿主要求审批的动作（沙箱升级等）在执行会话 turn 内发生，天然满足「打开的 turn」前提。
-- 状态映射：Run 执行中被审批挂起 → `awaiting_approval`；拒绝 → `failed`（原因保留）；超时未答复 → 按宿主语义失败，不自动放行。
+- 状态映射：Run 被审批挂起时为 `awaiting_approval`。拒绝记录在审批链中，Run 的终局由宿主回合结果和成果核对共同决定；交付正文说明未获通过的审批。执行超时取消宿主回合并保存失败档案。
 - 错误档案：所有失败保留原始错误结构（code/message/status/requestId/堆栈摘要）于 `errorRef` 指向的 artifacts 文件，DB 存摘要；禁止把失败改写为成功文本。
 - 移动端答复审批、过期 request 重发属于 M5；本阶段定义记录契约并联调桌面路径。
 
@@ -110,18 +110,18 @@ M2.4 依赖 M2.3 的执行器收口；M2.5 依赖 M2.3 的执行会话。M2.3 �
 ### 已确认的实现接缝（验收记录）
 
 - `Mission.kind` 落地为生命周期型（`once` / `recurring`），不是 PRD 的业务模板型（论文/申请/兴趣/investigate）。DB 对 kind 无 CHECK，M4 接三个模板与 investigate 时在域层扩类型或加 `template` 列（走新迁移），届时显式决策。
-- `ctx.icarus` 服务面：`ctx.provide('icarus', { missions })`，其他插件 `inject: ['icarus']` 取用；已用宿主 cordis 4.0.4 实测该机制成立。
-- 交付后状态入口为 `missions.recordDelivery(id)`；防重复交付靠 Outbox 状态，不靠状态机。
+- `ctx.icarus` 服务面：`ctx.provide('icarus', { missions, runs })`，其他插件声明 `inject: ['icarus']` 取用。
+- 交付确认与 `missions.recordDelivery(id)` 在同一 Outbox 结算事务内完成。Outbox 的原子领取与状态负责防止重复发送。
 - 代次校验用 `revision`，不用 `updatedAt`（pause/resume 也改 updatedAt）。
-- **预留在内存，不落库**：M2.4 的预留 = claim 时读到的 `budget - budgetUsed`，只作为本次 Run 的可用上限存在执行器内存里，没有 `Run.budgetReserved` 列。理由：M2.3 串行执行，没有并发方需要看见这份预留；落库反而会给人"闸门已考虑预留"的错觉。M4 做并发时按此接缝补齐——0002 迁移加 `Run.budgetReserved`，闸门从 `budgetUsed >= budget` 改成 `budgetUsed + 活跃预留 >= budget`，并在结算时释放预留。
-- **无估算式预留（留 M4）**：闸门只看已结算量（`budgetUsed >= budget` → 零调用），不做"输入规模估算 + 用户设定的最大输出"的预检。真正的预留式闸门需要先有估算策略与用户可配的上限，属 M4 并发+预算策略，M2.4 不擅自加参数。
-- **超支不销毁成果（拍板）**：超上限判定发生在模型调用之后（token 已消耗），因此 M2.4 采取"超上限照常核对、落库、投递，Run 记 `succeeded`，真实用量结算进 `budgetUsed`"。上限阻止的是新增调用（claim 闸门），不是已付费的交付。超支后 `budgetUsed > budget`、Run 视图 `remaining` 为负，超支记录在 `runs/<id>/budget.txt`（`kind: budget-overrun`，含 reserved/spent/overshoot），并在交付文本里显式提示；闸门在下一个 Run 生效。`runs/<id>/budget.txt` 的另一种是 `kind: budget-exhausted`（闸门拒绝，零调用）。
+- **请求前预留**：0003 迁移增加 `ModelCall`，保存调用归属、预留与实际用量。文本输入按 UTF-8 字节数及协议开销保守预留，附件使用模型路由的上下文上限。输出由 `execution.maxOutputTokens` 限制，默认 8192。
+- **共同预算**：事务内检查 Mission 的已用量及未结算预留；配置 `execution.userTokenBudget` 后同时检查本机用户的总额度。调用结束按真实 usage 结算一次。用量未知的调用保持预留，Run 预算视图展示 `reserved` 及扣除预留后的 `remaining`。
+- **实际进展与费用**：后续请求被预算拒绝时，Run 保存 `budget_exhausted`、已有进展及实际用量。已经发生的费用完整记录；历史调用或适配器异常造成的超支保留原成果与超支记录，阻止后续新增调用。
 - **M2.5 审批绑定（已落地）**：绑定不新增宿主接口——执行器监听自己创建的会话，把 `approval/asked`（`{id, toolName, callId?, reason?}`）与 `approval/decided`（`{id, outcome}`）折叠进 `Run.approvalRefs`（0002 迁移，`TEXT NOT NULL DEFAULT '[]'`，DB 存结构化链，原文留在执行会话日志）。Icarus 不注册应答者、不自动放行、不起自己的审批计时器；outcome 词表是宿主的封闭集合 `allowed-once/rejected/cancelled/unavailable`。
-- **`awaiting_approval` 是执行中状态，不是终态**：租约照常续（否则慢的人工答复必然租约过期、批准也无法提交）；`committable`/`finish`/`commit`/`recordUsage`/`attachSession`/`markSuperseded` 的状态条件统一放宽为 `status IN ('running','awaiting_approval')`。结算仍只由终态那一次条件 UPDATE 触发，挂起本身不结算；同一 turn 内可有多个未决请求，状态由链推导（还有 open 就保持 `awaiting_approval`，最后一条决定才回 `running`）。
+- **审批等待**：`awaiting_approval` 保持执行租约，多个未决请求全部关闭后恢复 `running`。模型请求各自结算；审批事件本身不产生用量。租约丢失时取消宿主回合。
 - **拒绝/取消/无应答都不杀 Run（D4 拍板）**：宿主拒绝只废那一次工具调用，回合照常 `completed`，一见 `rejected` 就判死会造成「turn 在跑、Run 已终态」的自残冲突，与 M2.4 超支同理。终局由 turn 收口 + 要求核对决定：核对通过 → 交付，交付文本必带「本次执行有 N 次审批未获通过：<工具>（<outcome>）」，绝不静默交付；核对不过 → `failed`，`runs/<id>/error.txt` 必含完整 asked/decided 配对（`requestId`/`toolName`/`callId`/`outcome`/两个时间戳）。
 - **错误档案固定结构（已落地）**：`runs/<id>/error.txt` = 头部（Run / Mission / revision / generation / 时间 / kind / detail / session / usage）+ 审批链（含仍 open 的请求）+ 工具错误（`tool/result` 的 `message` 与 `error.info`，按 callId 反查 `tool/call` 的名字）+ raw JSON（turn reason 原文；未捕获异常记 name、message 与前四行堆栈）。只有失败路径写这份档案，交付路径不碰它。
 - **`sessionController.prompt` 的第二参 signal 必传（联调打回修复）**：宿主 gateway 的 `prompt(request, signal)` 里是无条件 `signal.throwIfAborted()`（0.2.0-rc.2 `dsh-api-session-controller/lib/index.js:3096`），漏传会在受理前抛 `TypeError: Cannot read properties of undefined (reading 'throwIfAborted')`，Run 落 `failed / execution-error`。宿主自家 ds-bot 的传法是 `AbortSignal.timeout(30_000)`。现在两个调用点都传：`bridge/deliver.ts` 用投递超时，`execution/executor.ts` 用 `AbortSignal.any([unload, AbortSignal.timeout(30s)])` 只包受理阶段（回合由执行超时兜）。`types/host.d.ts` 把它标成必填，test harness 的 prompt 桩也断言第二参是 AbortSignal——这类「宿主签名必传参漏传」从此在 node:test 阶段就炸。
-- **`once` 委托的重新排期（总验收收尾补丁，拍板）**：`once` 只有一次到期，`enqueueDue` 消费它后清空 `nextDueAt`；这唯一一次若失败/被 supersede/被闸门拒绝，Mission 就停在 `active` 而无处可跑。规则：**`modify` 重新排期**——当 Mission 是 `once`、`active`、`nextDueAt` 为空、且没有任何 Deliverable 时，这次编辑把 `schedule` 与 `nextDueAt` 一起置到 `now + 5s`（`RESCHEDULE_DELAY_MS`，写进同一份 revision 快照）。重排只挂在编辑路径，不挂失败路径：失败即重排会把配额/传输错误变成失败-重试热循环，重跑次数由用户编辑次数封顶。视图不变量 `Mission.awaitingReschedule`（`once` + `active` + 无到期 + 无在途 Run + 无 Deliverable）把「还没被编辑的死角」显式暴露出来。**不引入 `retry()` 用户动作**；将来 M4 的自动重跑策略复用同一条域内重排路径。
+- **单次委托重新排期**：编辑仍为 `active` 且已消费到期时间的 `once` 委托时，将新 revision 的 `schedule` 与 `nextDueAt` 设为 `now + 5s`。旧成果保留在原 revision 中，旧交付不能完成新的要求。`awaitingReschedule` 根据当前 revision 的成果及在途执行计算；恢复已暂停且尚无当前成果的单次委托时重新排期。失败本身保留原状态，后续执行由用户的编辑或恢复动作触发。
 - **`recoverExpired()` 并入每个 pass（总验收收尾补丁）**：原先只在插件加载时跑一次，宿主在租约窗口内重启会让没有归属的 `running` Run 一直挂到下次重启。现在 `tick()` 的顺序是 续租 → recovery → 排队 → 领取执行，租约成为唯一栅栏；`TickReport.recovered` 把这次治愈的 Run 暴露出来。
 - **成果正文只取收尾答复（总验收收尾补丁）**：`TurnTracker` 按段收集 assistant 文本，`resultText()` 返回**最后一个 tool result 之后**的段落（多个按序拼接）；整轮没有 tool 调用时取最后一条 assistant 消息。理由：工具型回合的过场旁白（"作者信息已补齐，现在落盘"）不是成果。usage 累计仍收全部 assistant 消息，不受影响。
 
@@ -138,7 +138,7 @@ M2.4 依赖 M2.3 的执行器收口；M2.5 依赖 M2.3 的执行会话。M2.3 �
 ## 4. 明确不做（M2 边界）
 
 - 不接真实来源采集（M3），M2.3 的「成果」由执行会话直接产出。
-- 不做反馈与偏好整理（M4）、不做任何界面（M5）、不接 Telegram（M5）。
+- 反馈与偏好整理安排在 M4，界面与 QQ 接入安排在 M5。
 - 不写宿主 `schedule` 服务、不改 ds-bot 任何文件、不写 `state.json`（M1 已立禁令，延续有效）。
 
 ## 5. M2.5 实现计划（Dev 提交，待 Chief 过）
@@ -163,17 +163,17 @@ M2.4 依赖 M2.3 的执行器收口；M2.5 依赖 M2.3 的执行会话。M2.3 �
 
 ### 5.2 设计决定
 
-**D1 绑定路径 = 复用执行器现有的 `session/event` 监听**（`src/execution/executor.ts:152-175`）。监听器已按 Run 的 sessionId 建索引，审批事件与会话归属天然对齐；不新增监听器，不新增宿主依赖。
+**D1 审批绑定复用执行器的 `session/event` 监听。** 按 Run 的 sessionId 核查事件归属，保存当前执行的审批记录。
 
 **D2 存储 = 0002 迁移给 Run 加 `approvalRefs TEXT NOT NULL DEFAULT '[]'`。** DB 存结构化链（每条：`requestId / toolName / callId? / reason? / outcome / askedAt / decidedAt`），原始证据不复制——执行会话日志本身就是原文，`Run.sessionId` 已有指针。这是 §M2.5 写了、但 0001 没落的列：补迁移，不改已应用迁移。
 
-**D3 `awaiting_approval` = 「执行中」的另一种形态。** 租约照常续（否则人工审批稍慢就租约过期，批准也提交不了）；`committable` / `finish` / `commit` / `recordUsage` / `attachSession` / `markSuperseded` 的状态条件统一放宽为 `status IN ('running','awaiting_approval')`。条件 UPDATE 的「只结算一次」语义不变，CHECK 域不动。
+**D3 `awaiting_approval` 保持执行中的租约与用量记录。** 提交与结束均检查租约及当前 revision；审批等待不改变请求的计费次数。
 
-**D4 决定不杀 Run（需 Chief 裁定，本节与 §M2.5 单行措辞的唯一偏离）。** §M2.5 写「拒绝 → failed」，但宿主事实是：拒绝只让那一次工具调用返回错误，回合照常继续、通常仍以 `completed` 收尾。若一见 `rejected` 就把 Run 判死，就会出现「turn 还在跑、Run 已终态」，随后 commit 必然冲突——等于亲手作废一次已付费的执行，和 M2.4 超支拍板同一条道理。因此 `rejected` / `cancelled` / `unavailable` 一律只入链，Run 终局仍由 turn 收口 + 要求核对决定：核对不过 → `failed`，错误档案必带完整审批链；核对通过 → 交付，交付文本显式标注「本次执行有审批被拒」。请过计划时明确批这一条。
+**D4 审批拒绝保留在链中，终局由宿主回合与成果核对共同决定。** `rejected`、`cancelled` 与 `unavailable` 均保存原始结果。核对失败时记录 `failed` 并保留完整审批链；核对通过时交付正文，并明确说明未获通过的审批。
 
 **D5 错误档案 = 一份固定结构的原文文件。** `errorRef` 仍指向 `runs/<id>/error.txt`（失败）或 `budget.txt`（闸门/超支），DB 不新增摘要列。文件结构：头部（Run / Mission / revision / generation / 时间 / kind / detail）+ 审批链 + 工具错误（按序，`message` + `info`）+ turn 结束时 reason 原文 JSON + usage。失败档案只能由失败路径写，交付文本不能覆盖它。
 
-**D6 不做**：不注册应答者（自动化测试用的测试应答者只存在于 test 目录）、不自动放行任何 `rejected/cancelled/unavailable`、不自己起审批计时器（沿用执行超时兜底）、移动端答复属 M5。
+**D6 审批答复由宿主已有的用户通道处理。** 执行超时负责取消仍在等待的回合；移动端答复安排在 M5。
 
 ### 5.3 改动清单
 

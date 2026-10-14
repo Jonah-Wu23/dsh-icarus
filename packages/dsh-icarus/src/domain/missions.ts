@@ -23,6 +23,7 @@ import type { Schedule } from './schedule.js'
 import type { IcarusDatabase } from '../storage/index.js'
 
 export interface MissionService {
+  subscribe(listener: (mission: Mission) => void): () => void
   create(input: CreateMissionInput): Mission
   /** The Mission, or `MissionNotFoundError`. */
   get(id: string): Mission
@@ -134,6 +135,11 @@ export function inTransaction<T>(database: IcarusDatabase, run: () => T): T {
 }
 
 export function createMissionService(database: IcarusDatabase, options: MissionServiceOptions = {}): MissionService {
+  const listeners = new Set<(mission: Mission) => void>()
+  function changed(mission: Mission): Mission {
+    for (const listener of listeners) listener(mission)
+    return mission
+  }
   const now = options.now ?? (() => Date.now())
   const mintId = options.newId ?? newId
 
@@ -154,6 +160,7 @@ export function createMissionService(database: IcarusDatabase, options: MissionS
     const missionSlots = ids.map(() => '?').join(', ')
     const rows = database.db
       .prepare(`SELECT DISTINCT Run.missionId AS missionId FROM Deliverable JOIN Run ON Run.id = Deliverable.runId
+        JOIN Mission ON Mission.id = Run.missionId AND Mission.revision = Run.missionRevision
         WHERE Run.missionId IN (${missionSlots})`)
       .all<{ missionId: string }>(...ids)
     return new Set(rows.map(row => row.missionId))
@@ -244,7 +251,6 @@ export function createMissionService(database: IcarusDatabase, options: MissionS
     // other way back, so this edit re-arms it. An occurrence in flight is fine: this revision bump
     // supersedes that Run anyway, and the re-armed instant is what runs the new revision.
     const rearm = patchedDueAt === null && kind === 'once' && current.status === 'active'
-      && !missionIdsWithDeliverable([id]).has(id)
     const rearmedAt = at + RESCHEDULE_DELAY_MS
     const dueAt = rearm ? rearmedAt : patchedDueAt
     const storedSchedule: Schedule = rearm ? { kind: 'once', at: rearmedAt } : schedule
@@ -258,14 +264,14 @@ export function createMissionService(database: IcarusDatabase, options: MissionS
       if (revision === undefined) throw new MissionNotFoundError(id)
       database.db.prepare(INSERT_REVISION).run(id, revision.revision, kind, objective, requirementsJson, scheduleJson, timezone, budget, authorizationRef, at)
     })
-    return get(id)
+    return changed(get(id))
   }
 
   function transition(id: string, to: MissionStatus): Mission {
     const current = get(id)
     assertTransition(id, current.status, to)
     database.db.prepare('UPDATE Mission SET status = ?, updatedAt = ? WHERE id = ?').run(to, now(), id)
-    return get(id)
+    return changed(get(id))
   }
 
   function recordDelivery(id: string): MissionStatus {
@@ -297,12 +303,20 @@ export function createMissionService(database: IcarusDatabase, options: MissionS
   }
 
   return {
+    subscribe: listener => {
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
+    },
     create,
     get,
     list,
     modify,
     pause: id => transition(id, 'paused'),
-    resume: id => transition(id, 'active'),
+    resume: id => {
+      const mission = transition(id, 'active')
+      const rearm = mission.kind === 'once' && mission.nextDueAt === null && !missionIdsWithDeliverable([id]).has(id)
+      return rearm ? modify(id, {}) : mission
+    },
     cancel: id => transition(id, 'cancelled'),
     recordDelivery,
     history,

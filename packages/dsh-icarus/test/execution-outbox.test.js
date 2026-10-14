@@ -11,7 +11,7 @@ const LEASE = 60_000
 /** A claimed Run with a committed deliverable and one pending Outbox row. */
 function pendingOutbox(harness, bot = 'Chief') {
   const store = createRunStore(harness.database, { missions: harness.missions, now: harness.now })
-  const mission = harness.missions.create(baseMission())
+  const mission = harness.missions.create(baseMission({ ownerBotId: bot === 'Chief' ? CHIEF_SESSION : bot }))
   makeDue(harness.database, mission.id, harness.now())
   const run = store.enqueueDue(mission.id)
   store.claim(run.id, 'instance-a', LEASE)
@@ -56,7 +56,7 @@ test('a confirmed delivery settles the row as sent and is not repeated', async t
   assert.equal(harness.host.prompts.filter(request => request.sessionId === CHIEF_SESSION).length, 1)
 })
 
-test('a delivery that is never confirmed becomes delivery_unknown with a retry due', async t => {
+test('an unconfirmed delivery remains delivery_unknown without an automatic retry', async t => {
   const harness = openHarness(t, {
     onPrompt: async request => (request.sessionId === CHIEF_SESSION ? new Promise(() => {}) : { accepted: true }),
   })
@@ -67,7 +67,7 @@ test('a delivery that is never confirmed becomes delivery_unknown with a retry d
   const row = outbox.get(outboxId)
   assert.equal(row.status, 'delivery_unknown')
   assert.equal(row.attemptCount, 1)
-  assert.equal(row.nextAttemptAt, harness.now() + RETRY_DELAY)
+  assert.equal(row.nextAttemptAt, null)
   assert.match(harness.host.logged('warn').join('\n'), /unconfirmed/)
   assert.equal(harness.missions.get(mission.id).status, 'active', 'an unconfirmed send does not complete a Mission')
 })

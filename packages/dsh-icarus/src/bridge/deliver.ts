@@ -10,6 +10,7 @@ import type { IcarusContext } from '../types/host.js'
 export const DELIVERY_TIMEOUT_MS = 30_000
 
 export interface DeliveryRequest {
+  readonly requestId?: string
   /** Current own-chat Session id of the receiving Bot. */
   readonly sessionId: string
   readonly text: string
@@ -31,7 +32,7 @@ export async function deliver(ctx: IcarusContext, request: DeliveryRequest): Pro
   try {
     await ctx.sessionController.prompt(
       {
-        requestId: randomUUID(),
+        requestId: request.requestId ?? randomUUID(),
         sessionId: request.sessionId,
         mode: 'queue',
         content: [{ type: 'text', text: request.text }],

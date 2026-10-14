@@ -1,14 +1,8 @@
-// Outbox: the delivery step after a deliverable is persisted.
-//
-// Status machine (M2 plan §M2.1):
-//   pending → sent | delivery_unknown | failed
-// `sent` means the host accepted the prompt for the destination Session. `delivery_unknown`
-// means the attempt timed out or was aborted, so whether the Bot saw it cannot be told —
-// a later attempt is due. `failed` means the attempt was refused with a definite error. A
-// retry is a new attempt on the same row (attemptCount + 1); the worker that picks retries up
-// by `nextAttemptAt` is M3, so M2.3 records the schedule and stops there.
+// 发送前原子领取 Outbox 并保存未确认状态，宿主接受后记录 sent。
+// delivery_unknown 等待核查；明确失败可登记下一次尝试。
 import { deliver, errorText } from '../bridge/deliver.js'
 import { resolveIdentity } from '../bridge/identity.js'
+import { inTransaction } from '../domain/index.js'
 import type { IcarusContext } from '../types/host.js'
 import type { IcarusDatabase } from '../storage/index.js'
 import type { OutboxView } from './runs.js'
@@ -28,6 +22,7 @@ export interface DeliveryAttempt {
 }
 
 export interface OutboxOptions {
+  readonly onSent?: (deliverableId: string) => void
   readonly database: IcarusDatabase
   readonly ctx: IcarusContext
   /** Bot id or name that receives deliveries (`config.bot`). */
@@ -79,8 +74,11 @@ export function createOutboxService(options: OutboxOptions): OutboxService {
 
   function settle(outboxId: string, status: OutboxStatus, attemptCount: number, destinationRef: string | null): DeliveryAttempt {
     const at = now()
-    db.prepare('UPDATE Outbox SET status = ?, attemptCount = ?, destinationRef = ?, nextAttemptAt = ?, updatedAt = ? WHERE id = ?')
-      .run(status, attemptCount, destinationRef, status === 'sent' ? null : at + retryDelayMs, at, outboxId)
+    inTransaction(options.database, () => {
+      db.prepare('UPDATE Outbox SET status = ?, attemptCount = ?, destinationRef = ?, nextAttemptAt = ?, updatedAt = ? WHERE id = ?')
+        .run(status, attemptCount, destinationRef, status === 'failed' ? at + retryDelayMs : null, at, outboxId)
+      if (status === 'sent') options.onSent?.(rowOrThrow(outboxId).deliverableId)
+    })
     return { outboxId, status, destinationRef, attempted: true }
   }
 
@@ -88,19 +86,41 @@ export function createOutboxService(options: OutboxOptions): OutboxService {
     async attempt(outboxId) {
       const row = rowOrThrow(outboxId)
       if (row.status === 'sent') return { outboxId, status: 'sent', destinationRef: row.destinationRef, attempted: false }
-      const deliverable = db.prepare('SELECT content FROM Deliverable WHERE id = ?').get<{ content: string }>(row.deliverableId)
+      if (row.status === 'delivery_unknown') return { outboxId, status: 'delivery_unknown', destinationRef: row.destinationRef, attempted: false }
+      const deliverable = db.prepare(`SELECT Deliverable.content, Mission.ownerBotId FROM Deliverable
+        JOIN Run ON Run.id = Deliverable.runId JOIN Mission ON Mission.id = Run.missionId
+        WHERE Deliverable.id = ?`).get<{ content: string; ownerBotId: string }>(row.deliverableId)
       if (deliverable === undefined) throw new Error(`icarus: Outbox ${outboxId} points at missing Deliverable ${row.deliverableId}`)
       const attemptCount = row.attemptCount + 1
+      const claimed = db.prepare(`UPDATE Outbox SET status = 'delivery_unknown', attemptCount = ?, nextAttemptAt = NULL, updatedAt = ?
+        WHERE id = ? AND status IN ('pending', 'failed') AND attemptCount = ?`).run(attemptCount, now(), outboxId, row.attemptCount)
+      if (Number(claimed.changes) === 0) {
+        const current = rowOrThrow(outboxId)
+        return { outboxId, status: current.status as OutboxStatus, destinationRef: current.destinationRef, attempted: false }
+      }
       const controller = new AbortController()
+      let destinationRef: string
       try {
-        const identity = await resolveIdentity(options.bot, { dshHome: options.dshHome })
+        const identity = await resolveIdentity(deliverable.ownerBotId, { dshHome: options.dshHome })
+        const current = db.prepare(`SELECT Mission.revision, Mission.status, Run.missionRevision FROM Deliverable
+          JOIN Run ON Run.id = Deliverable.runId JOIN Mission ON Mission.id = Run.missionId WHERE Deliverable.id = ?`)
+          .get<{ revision: number; status: string; missionRevision: number }>(row.deliverableId)
+        if (current === undefined || current.revision !== current.missionRevision || current.status === 'cancelled') {
+          throw new Error('icarus: delivery belongs to a cancelled or superseded Mission')
+        }
+        destinationRef = identity.sessionId
         await withTimeout(
-          deliver(options.ctx, { sessionId: identity.sessionId, text: deliverable.content, signal: controller.signal, timeoutMs }),
+          deliver(options.ctx, {
+            requestId: outboxId,
+            sessionId: identity.sessionId,
+            text: `Icarus 后台成果已保存。请阅读下面的交付记录，用简短答复说明结论及关键依据。\n\n${deliverable.content}`,
+            signal: controller.signal,
+            timeoutMs,
+          }),
           timeoutMs,
           controller,
         )
         options.ctx.logger.info('icarus: delivered %s to %s (%s)', row.deliverableId, identity.name, identity.sessionId)
-        return settle(outboxId, 'sent', attemptCount, identity.sessionId)
       } catch (error) {
         // The raw error is logged as it arrived; the Outbox row records only what the
         // attempt established. A channel receipt reference is M3 (no receipt column until then).
@@ -111,6 +131,7 @@ export function createOutboxService(options: OutboxOptions): OutboxService {
         options.ctx.logger.error('icarus: delivery of %s failed: %s', row.deliverableId, errorText(error))
         return settle(outboxId, 'failed', attemptCount, row.destinationRef)
       }
+      return settle(outboxId, 'sent', attemptCount, destinationRef)
     },
 
     get(outboxId) {

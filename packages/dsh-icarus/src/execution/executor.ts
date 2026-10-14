@@ -1,18 +1,6 @@
-// Executor: one claimed Run, driven through an Icarus-owned execution Session.
-//
-// Flow: claim → `sessionController.create({ cwd: workspaceDir })` → prompt carrying the
-// pinned revision's objective/requirements → collect the turn from `session/event` →
-// requirement check → Deliverable + artifact + Outbox(pending) → delivery attempt →
-// `missions.recordDelivery`.
-//
-// The prompt carries an AbortSignal because the host gateway dereferences it unconditionally
-// (`signal.throwIfAborted()`); it bounds admission, and unload aborts it through `AbortSignal.any`.
-//
-// Only Sessions this executor created are observed: the event listener keys on the Session
-// id of a Run it started, so Bot chats and other plugins' Sessions never enter collection.
-// A turn that ends with a non-completed reason, or does not end within the timeout, fails the
-// Run with the raw reason; the Session is left running (M2.3 has no cancel call in the
-// verified surface) and its later events are ignored once untracked.
+// 固定 Mission revision 执行，核对成果后持久保存交付记录。
+// 请求边界负责预留与结算预算；超时、修改及卸载通过宿主取消仍在运行的回合。
+// 重启先核查宿主会话，已完成的回合沿用原成果提交。
 import { randomUUID } from 'node:crypto'
 import { errorText } from '../bridge/deliver.js'
 import { newId as mintId } from '../domain/ids.js'
@@ -22,6 +10,7 @@ import { absoluteArtifactPath, artifactRef, contentHash, writeArtifact } from '.
 import { OUTBOX_CHANNEL_BOT } from './outbox.js'
 import { MIN_RESULT_CHARS, checkDeliverable } from './requirements.js'
 import { APPROVAL_OUTCOMES, SupersededError, spentTokens } from './runs.js'
+import { DEFAULT_MAX_OUTPUT_TOKENS, installModelBudget } from './model-budget.js'
 import type { Mission, MissionRevision, MissionService } from '../domain/index.js'
 import type { IcarusDatabase, IcarusPaths } from '../storage/index.js'
 import type { IcarusContext, SessionEventLike } from '../types/host.js'
@@ -45,15 +34,20 @@ export interface ExecutionOutcome {
 }
 
 export interface Executor {
+  leaseLost?(runId: string): void
+  missionChanged?(mission: Mission): void
+  recover?(): Promise<void>
   /** Claim and run one Run. Never throws for a Run that simply lost its lease. */
   execute(runId: string): Promise<ExecutionOutcome>
   /** Run ids currently in flight on this instance. */
   active(): readonly string[]
   /** Plugin unload: settle pending turns without writing to the database. */
-  dispose(): void
+  dispose(): Promise<void>
 }
 
 export interface ExecutorOptions {
+  readonly maxOutputTokens?: number
+  readonly userTokenBudget?: number | null
   readonly ctx: IcarusContext
   readonly database: IcarusDatabase
   readonly paths: IcarusPaths
@@ -123,6 +117,7 @@ interface ToolErrorRecord {
  * that called no tool at all.
  */
 class TurnTracker {
+  bookkeepingFailure: FailureRecord | null = null
   readonly texts: string[] = []
   readonly toolErrors: ToolErrorRecord[] = []
   /** Tool names by call id, so a tool error can name the tool it came from. */
@@ -202,6 +197,17 @@ export function createExecutor(options: ExecutorOptions): Executor {
   /** Aborted on unload, so a prompt still being admitted does not outlive the plugin. */
   const unloading = new AbortController()
   let disposed = false
+  const budgetFailures = new Map<string, Error>()
+  const modelBudget = installModelBudget({
+    ctx,
+    database: options.database,
+    maxOutputTokens: options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+    userTokenBudget: options.userTokenBudget ?? null,
+    onBlocked: (runId, error, purpose) => {
+      if (purpose !== 'session-title' && [...turns.values()].some(turn => turn.runId === runId)) budgetFailures.set(runId, error)
+      else ctx.logger.warn('icarus: Run %s auxiliary request refused: %s', runId, error.message)
+    },
+  })
 
   ctx.on('session/event', (session, event) => {
     const sessionId = session?.id
@@ -215,11 +221,11 @@ export function createExecutor(options: ExecutorOptions): Executor {
       if (usage !== null) {
         turn.usage = addUsage(turn.usage, usage)
         try {
-          // Progress, not the final word: a Run superseded or killed mid-flight must still
-          // settle what it actually spent. A failed progress write must not break the host's
-          // event dispatch, so it only warns.
+          // 保存实际进展；记账失败会取消回合并保留失败状态。
           store.recordUsage(turn.runId, options.instanceId, turn.usage)
         } catch (error) {
+          turn.bookkeepingFailure = { code: 'ICARUS_BOOKKEEPING_ERROR', message: errorText(error) }
+          modelBudget.stop(turn.runId)
           ctx.logger.warn('icarus: could not record partial usage for Run %s: %s', turn.runId, errorText(error))
         }
       }
@@ -248,6 +254,8 @@ export function createExecutor(options: ExecutorOptions): Executor {
           ctx.logger.warn('icarus: Run %s is no longer executing; approval %s was not bound', turn.runId, request.requestId)
         }
       } catch (error) {
+        turn.bookkeepingFailure = { code: 'ICARUS_BOOKKEEPING_ERROR', message: errorText(error) }
+        modelBudget.stop(turn.runId)
         // The host's dispatch must survive a failed bookkeeping write.
         ctx.logger.warn('icarus: could not bind approval %s to Run %s: %s', request.requestId, turn.runId, errorText(error))
       }
@@ -261,6 +269,8 @@ export function createExecutor(options: ExecutorOptions): Executor {
           ctx.logger.warn('icarus: approval %s of Run %s had no open request to close', decision.requestId, turn.runId)
         }
       } catch (error) {
+        turn.bookkeepingFailure = { code: 'ICARUS_BOOKKEEPING_ERROR', message: errorText(error) }
+        modelBudget.stop(turn.runId)
         ctx.logger.warn('icarus: could not record approval %s for Run %s: %s', decision.requestId, turn.runId, errorText(error))
       }
       return
@@ -293,12 +303,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
 
   /** The Run's approval chain as stored; a read failure must not swallow the failure itself. */
   function approvalsOf(runId: string): readonly ApprovalRef[] {
-    try {
-      return store.get(runId).approvalRefs
-    } catch (error) {
-      ctx.logger.warn('icarus: could not read the approval chain of Run %s: %s', runId, errorText(error))
-      return []
-    }
+    return store.get(runId).approvalRefs
   }
 
   /**
@@ -318,6 +323,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
       `mission: ${run.missionId} revision ${run.missionRevision} generation ${run.generation}`,
       `session: ${turn?.sessionId ?? run.sessionId ?? 'none'}`,
       `usage: ${JSON.stringify(turn?.usage ?? run.usage ?? null)}`,
+      `progress: ${turn?.resultText() ?? ''}`,
       '',
       `approval chain (${approvals.length}):`,
       ...(approvals.length === 0 ? ['  none'] : approvals.map(approvalLine)),
@@ -331,6 +337,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
   }
 
   function fail(run: Run, turn: TurnTracker | null, kind: string, detail: string, raw: unknown): ExecutionOutcome {
+    store.committable(run.id, options.instanceId)
     const ref = artifactRef('runs', run.id, 'error.txt')
     writeArtifact(paths, ref, failureArchive(run, kind, detail, raw, turn))
     try {
@@ -440,6 +447,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
   }
 
   async function complete(run: Run, turn: TurnTracker, gate: BudgetState): Promise<ExecutionOutcome> {
+    store.committable(run.id, options.instanceId)
     const text = turn.resultText()
     if (missions.get(run.missionId).status === 'cancelled') {
       store.finish(run.id, options.instanceId, { status: 'cancelled', usage: turn.usage, errorRef: null })
@@ -481,15 +489,6 @@ export function createExecutor(options: ExecutorOptions): Executor {
       usage: turn.usage,
     })
     const attempt = await options.outbox.attempt(commit.outboxId)
-    if (attempt.status === 'sent') {
-      try {
-        missions.recordDelivery(run.missionId)
-      } catch (error) {
-        // The deliverable and the sent receipt are already durable; a status write that
-        // refuses (for example an already completed once Mission) must not undo them.
-        ctx.logger.error('icarus: Mission %s status not updated after delivery: %s', run.missionId, errorText(error))
-      }
-    }
     return { runId: run.id, status: 'succeeded', detail: `outbox ${attempt.status}` }
   }
 
@@ -524,7 +523,22 @@ export function createExecutor(options: ExecutorOptions): Executor {
       turn.armTimeout(timeoutMs)
       const end = await turn.done
       if (disposed || end.kind === 'abandoned') return { runId, status: 'abandoned', detail: 'the plugin unloaded while the turn was open' }
+      const current = missions.get(claimed.missionId)
+      if (current.revision !== claimed.missionRevision) store.committable(runId, options.instanceId)
+      if (current.status === 'cancelled' || current.status === 'paused') {
+        store.finish(runId, options.instanceId, { status: 'cancelled', usage: turn.usage })
+        return { runId, status: 'cancelled', detail: `Mission is ${current.status}` }
+      }
+      if (turn.bookkeepingFailure !== null) return fail(claimed, turn, 'bookkeeping-error', turn.bookkeepingFailure.message, turn.bookkeepingFailure)
+      const blocked = budgetFailures.get(runId)
+      if (blocked !== undefined) {
+        const ref = artifactRef('runs', runId, 'budget.txt')
+        writeArtifact(paths, ref, failureArchive(claimed, 'budget-exhausted', blocked.message, { progress: turn.resultText() }, turn))
+        store.finish(runId, options.instanceId, { status: 'budget_exhausted', usage: turn.usage, errorRef: ref })
+        return { runId, status: 'budget_exhausted', detail: blocked.message }
+      }
       if (end.kind === 'timeout') {
+        modelBudget.stop(runId)
         // A timeout with a request still open is named for what actually blocked the turn: the
         // host has no approval timer of its own, so our wall clock is what ends the wait.
         const waiting = approvalsOf(claimed.id).some(entry => entry.outcome === null)
@@ -538,23 +552,80 @@ export function createExecutor(options: ExecutorOptions): Executor {
     } catch (error) {
       if (disposed) return { runId, status: 'abandoned', detail: 'the plugin unloaded during the Run' }
       if (error instanceof SupersededError) return { runId, status: 'superseded', detail: error.reason }
+      if (store.get(runId).status === 'succeeded') throw error
       return fail(claimed, turn ?? null, 'execution-error', errorText(error), {
         sessionId: turn?.sessionId ?? null,
         error: { name: errorName(error), message: errorText(error), stack: stackSummary(error) },
       })
     } finally {
       if (turn !== undefined) turns.delete(turn.sessionId)
+      budgetFailures.delete(runId)
+    }
+  }
+
+  async function recover(): Promise<void> {
+    const expired = store.list().filter(run => (run.status === 'running' || run.status === 'awaiting_approval')
+      && (run.leaseUntil === null || run.leaseUntil <= now()) && ![...turns.values()].some(turn => turn.runId === run.id))
+    for (const run of expired) {
+      if (run.sessionId === null) continue
+      const observation = await ctx.sessionQuery.observeSession(run.sessionId, { projectionMode: 'none' })
+      try {
+        const events = observation.events
+        const turn = new TurnTracker(run.sessionId, run.id)
+        let end: TurnEnd | undefined
+        for (const event of events) {
+          if (event.type === 'assistant/message') turn.say(textOfMessage(event))
+          if (event.type === 'tool/result') turn.sawToolResult()
+          if (event.type === 'assistant/message' || event.type === 'assistant/attempt') {
+            const usage = usageOfEvent(event)
+            if (usage !== null) turn.usage = addUsage(turn.usage, usage)
+          }
+          if (event.type === 'turn/end') end = endOfEvent(event)
+        }
+        if (end?.kind === 'completed') {
+          const claimed = store.reclaim(run.id, options.instanceId, options.leaseMs ?? DEFAULT_LEASE_MS)
+          if (claimed === null) continue
+          try {
+            await complete(claimed, turn, budgetStateOf(missions.get(run.missionId)))
+          } catch (error) {
+            if (!(error instanceof SupersededError)) throw error
+          }
+        } else {
+          // 保留宿主已写入的实际用量，再由代次恢复流程登记新的执行尝试。
+          if (turn.usage !== null) {
+            options.database.db.prepare('UPDATE Run SET usage = ? WHERE id = ?').run(JSON.stringify(turn.usage), run.id)
+          }
+          if (ctx.sessions.get(run.sessionId) !== undefined) ctx.sessionController.cancel({ sessionId: run.sessionId })
+        }
+      } finally {
+        observation[Symbol.dispose]()
+      }
     }
   }
 
   return {
     execute,
+    recover,
+    leaseLost: runId => { modelBudget.stop(runId) },
+    missionChanged: mission => {
+      if (mission.status === 'cancelled' || mission.status === 'completed') {
+        options.database.db.prepare("UPDATE Run SET status = 'cancelled', endedAt = ? WHERE missionId = ? AND status = 'queued'")
+          .run(now(), mission.id)
+      }
+      const runs = options.database.db.prepare('SELECT id, missionRevision FROM Run WHERE missionId = ?')
+        .all<{ id: string; missionRevision: number }>(mission.id)
+      for (const run of runs) {
+        if (mission.status !== 'active' || mission.revision !== run.missionRevision) modelBudget.stop(run.id)
+      }
+    },
     active: () => [...turns.values()].map(turn => turn.runId),
-    dispose: () => {
+    dispose: async () => {
       disposed = true
       unloading.abort()
+      const draining = modelBudget.dispose()
       for (const turn of turns.values()) turn.settle({ kind: 'abandoned' })
       turns.clear()
+      await draining
     },
   }
 }

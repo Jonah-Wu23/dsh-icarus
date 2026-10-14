@@ -31,6 +31,7 @@
 import { newId as mintId } from '../domain/ids.js'
 import { inTransaction } from '../domain/index.js'
 import { nextDueAt } from '../domain/schedule.js'
+import { modelCallUsage } from './model-budget.js'
 import type { Mission, MissionService } from '../domain/index.js'
 import type { IcarusDatabase } from '../storage/index.js'
 
@@ -131,6 +132,7 @@ export type RunView = Run & {
 export interface RunBudgetView {
   readonly budget: number | null
   readonly budgetUsed: number
+  readonly reserved: number
   readonly remaining: number | null
 }
 
@@ -177,6 +179,7 @@ export interface RunStore {
   queuedIds(): string[]
   /** Claim a queued Run for this instance; null when it cannot be claimed. */
   claim(runId: string, instanceId: string, leaseMs: number): Run | null
+  reclaim(runId: string, instanceId: string, leaseMs: number): Run | null
   renew(runId: string, instanceId: string, leaseMs: number): boolean
   attachSession(runId: string, instanceId: string, sessionId: string): boolean
   /** The Run, or a SupersededError naming why it may not commit. */
@@ -307,12 +310,13 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
       ? db.prepare(`UPDATE Run SET status = 'superseded', endedAt = ? WHERE id = ? AND status IN ('queued', ${EXECUTING_STATUSES})`).run(at, runId)
       : db.prepare(`UPDATE Run SET status = 'superseded', endedAt = ? WHERE id = ? AND status IN (${EXECUTING_STATUSES}) AND leaseOwner = ?`).run(at, runId, instanceId)
     const changes = Number(result.changes)
-    if (changes > 0) settle(row.missionId, row.usage)
+    if (changes > 0) settle(row.missionId, row.usage, runId)
     return changes
   }
 
   /** Add one Run's settled spend to the Mission. Must run inside the transition's transaction. */
-  function settle(missionId: string, usage: string | null): void {
+  function settle(missionId: string, usage: string | null, runId: string): void {
+    if (db.prepare('SELECT id FROM ModelCall WHERE runId = ? LIMIT 1').get(runId) !== undefined) return
     const spend = spentTokens(usage === null ? null : (JSON.parse(usage) as TokenUsage))
     if (spend === 0) return
     db.prepare('UPDATE Mission SET budgetUsed = budgetUsed + ? WHERE id = ?').run(spend, missionId)
@@ -321,7 +325,9 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
   function budgetOf(missionId: string): RunBudgetView {
     const row = db.prepare('SELECT budget, budgetUsed FROM Mission WHERE id = ?').get<{ budget: number | null; budgetUsed: number }>(missionId)
     if (row === undefined) throw new Error(`icarus: Run points at missing Mission ${JSON.stringify(missionId)}`)
-    return { budget: row.budget, budgetUsed: row.budgetUsed, remaining: row.budget === null ? null : row.budget - row.budgetUsed }
+    const reserved = db.prepare(`SELECT COALESCE(SUM(ModelCall.reservedTokens), 0) AS tokens FROM ModelCall
+      JOIN Run ON Run.id = ModelCall.runId WHERE Run.missionId = ? AND ModelCall.status <> 'settled'`).get<{ tokens: number }>(missionId)?.tokens ?? 0
+    return { budget: row.budget, budgetUsed: row.budgetUsed, reserved, remaining: row.budget === null ? null : row.budget - row.budgetUsed - reserved }
   }
 
   function deliverablesOf(runId: string): DeliverableView[] {
@@ -354,6 +360,7 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
       const mission = options.missions.get(missionId)
       if (mission.status !== 'active') return null
       if (mission.nextDueAt === null || mission.nextDueAt > at) return null
+      if (db.prepare(`SELECT id FROM Run WHERE missionId = ? AND status IN ('queued', ${EXECUTING_STATUSES}) LIMIT 1`).get(missionId) !== undefined) return null
       const runId = insertQueued(mission, at)
       // A once Mission has no next occurrence, so clearing the due time is what keeps the
       // next tick from creating another Run. A recurring Mission rolls forward, so a
@@ -370,6 +377,12 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
       const row = readRow(runId)
       if (row === undefined || row.status !== 'queued') return null
       const mission = options.missions.get(row.missionId)
+      if (mission.status !== 'active') {
+        if (mission.status !== 'paused') db.prepare("UPDATE Run SET status = 'cancelled', endedAt = ? WHERE id = ? AND status = 'queued'").run(at, runId)
+        return null
+      }
+      const executing = db.prepare(`SELECT id FROM Run WHERE missionId = ? AND status IN (${EXECUTING_STATUSES}) AND id <> ?`).get(row.missionId, runId)
+      if (executing !== undefined) return null
       if (row.missionRevision !== mission.revision) {
         // The definition moved on while this attempt waited: refuse it and queue a fresh
         // attempt at the current revision instead of spending a model call on stale text.
@@ -405,6 +418,7 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
   }
 
   function recordUsage(runId: string, instanceId: string, usage: TokenUsage | null): boolean {
+    usage = modelCallUsage(database, runId) ?? usage
     const result = db.prepare(`UPDATE Run SET usage = ? WHERE id = ? AND status IN (${EXECUTING_STATUSES}) AND leaseOwner = ?`)
       .run(usage === null ? null : JSON.stringify(usage), runId, instanceId)
     return Number(result.changes) > 0
@@ -454,11 +468,12 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
     const at = now()
     return inTransaction(database, () => {
       const missionId = rowOrThrow(runId).missionId
+      const usage = modelCallUsage(database, runId) ?? outcome.usage
       const result = db.prepare(`UPDATE Run SET status = ?, usage = ?, errorRef = ?, endedAt = ? WHERE id = ? AND status IN (${EXECUTING_STATUSES}) AND leaseOwner = ?`)
-        .run(outcome.status, outcome.usage === null ? null : JSON.stringify(outcome.usage), outcome.errorRef ?? null, at, runId, instanceId)
+        .run(outcome.status, usage === null ? null : JSON.stringify(usage), outcome.errorRef ?? null, at, runId, instanceId)
       // Only the transaction that actually ended the Run charges the Mission.
       if (Number(result.changes) === 0) throw new SupersededError(runId, 'the Run is no longer running')
-      settle(missionId, outcome.usage === null ? null : JSON.stringify(outcome.usage))
+      settle(missionId, usage === null ? null : JSON.stringify(usage), runId)
       return toRun(rowOrThrow(runId))
     })
   }
@@ -483,10 +498,11 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
       db.prepare(`INSERT INTO Outbox (id, deliverableId, channel, destinationRef, status, attemptCount, receiptRef, nextAttemptAt, createdAt, updatedAt)
         VALUES (?, ?, ?, NULL, 'pending', 0, NULL, NULL, ?, ?)`)
         .run(input.outboxId, input.deliverable.id, input.channel, at, at)
+      const usage = modelCallUsage(database, runId) ?? input.usage
       const result = db.prepare(`UPDATE Run SET status = 'succeeded', usage = ?, endedAt = ? WHERE id = ? AND status IN (${EXECUTING_STATUSES}) AND leaseOwner = ?`)
-        .run(input.usage === null ? null : JSON.stringify(input.usage), at, runId, instanceId)
+        .run(usage === null ? null : JSON.stringify(usage), at, runId, instanceId)
       if (Number(result.changes) === 0) throw new SupersededError(runId, 'the Run stopped running before its deliverable was persisted')
-      settle(missionId, input.usage === null ? null : JSON.stringify(input.usage))
+      settle(missionId, usage === null ? null : JSON.stringify(usage), runId)
     })
     return { deliverableId: input.deliverable.id, outboxId: input.outboxId }
   }
@@ -533,9 +549,23 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
 
   return {
     enqueueDue,
-    queuedIds: () => db.prepare("SELECT id FROM Run WHERE status = 'queued' ORDER BY createdAt, id").all<{ id: string }>().map(row => row.id),
+    queuedIds: () => db.prepare("SELECT Run.id FROM Run JOIN Mission ON Mission.id = Run.missionId WHERE Run.status = 'queued' AND Mission.status = 'active' ORDER BY Run.createdAt, Run.id").all<{ id: string }>().map(row => row.id),
     claim,
-    renew: (runId, instanceId, leaseMs) => Number(db.prepare(`UPDATE Run SET leaseUntil = ? WHERE id = ? AND status IN (${EXECUTING_STATUSES}) AND leaseOwner = ?`).run(now() + leaseMs, runId, instanceId).changes) > 0,
+    reclaim: (runId, instanceId, leaseMs) => inTransaction(database, () => {
+      const row = rowOrThrow(runId)
+      const mission = options.missions.get(row.missionId)
+      if (mission.status !== 'active' || mission.revision !== row.missionRevision) return null
+      const at = now()
+      const result = db.prepare(`UPDATE Run SET leaseOwner = ?, leaseUntil = ? WHERE id = ?
+        AND status IN (${EXECUTING_STATUSES}) AND (leaseUntil IS NULL OR leaseUntil <= ?)`)
+        .run(instanceId, at + leaseMs, runId, at)
+      return Number(result.changes) === 0 ? null : toRun(rowOrThrow(runId))
+    }),
+    renew: (runId, instanceId, leaseMs) => {
+      const at = now()
+      return Number(db.prepare(`UPDATE Run SET leaseUntil = ? WHERE id = ? AND status IN (${EXECUTING_STATUSES}) AND leaseOwner = ? AND leaseUntil > ?`)
+        .run(at + leaseMs, runId, instanceId, at).changes) > 0
+    },
     attachSession: (runId, instanceId, sessionId) => Number(db.prepare(`UPDATE Run SET sessionId = ? WHERE id = ? AND status IN (${EXECUTING_STATUSES}) AND leaseOwner = ?`).run(sessionId, runId, instanceId).changes) > 0,
     committable,
     finish,

@@ -8,6 +8,7 @@ import { newId as mintId } from '../domain/ids.js'
 import { createExecutor, DEFAULT_EXECUTION_TIMEOUT_MS, DEFAULT_LEASE_MS } from './executor.js'
 import { DELIVERY_TIMEOUT_MS, RETRY_DELAY_MS, createOutboxService } from './outbox.js'
 import { createRunStore } from './runs.js'
+import { DEFAULT_MAX_OUTPUT_TOKENS } from './model-budget.js'
 import { DEFAULT_MAX_RUNS_PER_TICK, DEFAULT_TICK_MS, createScheduler } from './scheduler.js'
 import type { MissionService } from '../domain/index.js'
 import type { IcarusDatabase } from '../storage/index.js'
@@ -18,6 +19,7 @@ import type { RecoveryReport, RunListFilter, RunStore, RunView } from './runs.js
 import type { Scheduler, TickReport } from './scheduler.js'
 
 export { DEFAULT_ACCEPT_TIMEOUT_MS, DEFAULT_EXECUTION_TIMEOUT_MS, DEFAULT_LEASE_MS } from './executor.js'
+export { DEFAULT_MAX_OUTPUT_TOKENS } from './model-budget.js'
 export { DELIVERY_TIMEOUT_MS, OUTBOX_CHANNEL_BOT, OutboxNotFoundError, RETRY_DELAY_MS, createOutboxService } from './outbox.js'
 export type { DeliveryAttempt, OutboxOptions, OutboxService, OutboxStatus } from './outbox.js'
 export { APPROVAL_OUTCOMES, RunNotFoundError, RUN_STATUSES, SupersededError, createRunStore, spentTokens } from './runs.js'
@@ -38,6 +40,8 @@ export interface RunService {
 }
 
 export interface ExecutionOptions {
+  readonly maxOutputTokens?: number
+  readonly userTokenBudget?: number | null
   readonly ctx: IcarusContext
   readonly database: IcarusDatabase
   readonly missions: MissionService
@@ -69,7 +73,7 @@ export interface IcarusExecution {
   readonly recovery: RecoveryReport
   /** Register the repeating pass (no-op when disabled). */
   start(): void
-  dispose(): void
+  dispose(): Promise<void>
 }
 
 export function createExecution(options: ExecutionOptions): IcarusExecution {
@@ -89,6 +93,13 @@ export function createExecution(options: ExecutionOptions): IcarusExecution {
     now,
     retryDelayMs: RETRY_DELAY_MS,
     timeoutMs: options.deliveryTimeoutMs ?? DELIVERY_TIMEOUT_MS,
+    onSent: deliverableId => {
+      const run = options.database.db.prepare('SELECT Run.missionId, Run.missionRevision FROM Deliverable JOIN Run ON Run.id = Deliverable.runId WHERE Deliverable.id = ?')
+        .get<{ missionId: string; missionRevision: number }>(deliverableId)
+      if (run === undefined) throw new Error('icarus: confirmed delivery has no Run')
+      const mission = options.missions.get(run.missionId)
+      if (mission.revision === run.missionRevision && mission.status !== 'cancelled' && mission.status !== 'completed') options.missions.recordDelivery(mission.id)
+    },
   })
   const executor = createExecutor({
     ctx: options.ctx,
@@ -102,6 +113,8 @@ export function createExecution(options: ExecutionOptions): IcarusExecution {
     newId,
     leaseMs,
     timeoutMs: options.timeoutMs ?? DEFAULT_EXECUTION_TIMEOUT_MS,
+    maxOutputTokens: options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
+    userTokenBudget: options.userTokenBudget ?? null,
   })
   const scheduler = createScheduler({
     database: options.database,
@@ -113,14 +126,22 @@ export function createExecution(options: ExecutionOptions): IcarusExecution {
     leaseMs,
     maxRunsPerTick: options.maxRunsPerTick ?? DEFAULT_MAX_RUNS_PER_TICK,
   })
+  const unsubscribe = options.missions.subscribe(mission => executor.missionChanged?.(mission))
 
-  const recovery: RecoveryReport = enabled ? scheduler.recover() : { superseded: [], requeued: [] }
+  const recovery: RecoveryReport = { superseded: [], requeued: [] }
   let interval: (() => void) | undefined
   let running = false
+  let pendingTick: Promise<TickReport> | undefined
+
+  function tick(): Promise<TickReport> {
+    if (pendingTick !== undefined) return pendingTick
+    pendingTick = scheduler.tick().finally(() => { pendingTick = undefined })
+    return pendingTick
+  }
 
   return {
     instanceId,
-    runs: { get: runId => store.get(runId), list: filter => store.list(filter), tick: () => scheduler.tick() },
+    runs: { get: runId => store.get(runId), list: filter => store.list(filter), tick },
     store,
     outbox,
     executor,
@@ -128,24 +149,29 @@ export function createExecution(options: ExecutionOptions): IcarusExecution {
     recovery,
     start() {
       if (!enabled || interval !== undefined) return
+      void tick().catch(error => options.ctx.logger.error('icarus: startup recovery failed: %s', errorText(error)))
+      let lastScan = now()
       interval = options.ctx.interval(() => {
         // Renewal stays outside the overlap guard: a Run that outlives several ticks must
         // keep its lease, while a still-running pass must not be started twice.
         scheduler.renewLeases()
-        if (running) return
+        if (running || now() - lastScan < tickMs) return
+        lastScan = now()
         running = true
-        void scheduler
-          .tick()
+        void tick()
           .catch(error => {
             options.ctx.logger.error('icarus: scheduling pass failed: %s', errorText(error))
           })
           .finally(() => {
             running = false
           })
-      }, tickMs)
+      }, Math.min(tickMs, Math.max(1, Math.floor(leaseMs / 3))))
     },
-    dispose() {
-      executor.dispose()
+    async dispose() {
+      unsubscribe()
+      interval?.()
+      await executor.dispose()
+      await pendingTick
     },
   }
 }

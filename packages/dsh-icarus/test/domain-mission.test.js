@@ -256,7 +256,7 @@ test('a once Mission whose Run is still in flight is not waiting for a reschedul
   assert.equal(missions.get(created.id).awaitingReschedule, false)
 })
 
-test('a once Mission that already delivered is not re-armed by an edit', t => {
+test('editing an active once Mission schedules its new revision after an earlier result', t => {
   const { database, missions } = openDomain(t)
   const created = onceMission(missions)
   consumeDueTime(database, created.id)
@@ -266,11 +266,12 @@ test('a once Mission that already delivered is not re-armed by an edit', t => {
     VALUES ('del_done', 'run_done', '{}', '[]', '[]', '成果', 'hash', ?)`).run(NOW)
 
   assert.equal(missions.get(created.id).awaitingReschedule, false)
-  const edited = missions.modify(created.id, { objective: '改了也不该重跑' })
-  assert.equal(edited.nextDueAt, null, 'a delivered result is never delivered twice')
+  const edited = missions.modify(created.id, { objective: '按新的要求执行' })
+  assert.equal(edited.nextDueAt, NOW + RESCHEDULE_DELAY_MS)
+  assert.equal(edited.revision, 2)
 })
 
-test('a once Mission that already delivered but is still active is listed as not waiting', t => {
+test('a failed once Mission is listed as waiting for a reschedule', t => {
   const { database, missions } = openDomain(t)
   const created = onceMission(missions)
   consumeDueTime(database, created.id)

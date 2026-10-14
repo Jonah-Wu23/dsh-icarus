@@ -51,7 +51,7 @@ test('a Mission with no budget left produces a budget_exhausted Run without any 
   assert.match(note, /reserved \(remaining at claim\): 0/)
   assert.match(note, /no model call was made/)
   assert.equal(harness.missions.get(mission.id).budgetUsed, 0)
-  assert.deepEqual({ ...run.budget }, { budget: 0, budgetUsed: 0, remaining: 0 })
+  assert.deepEqual({ ...run.budget }, { budget: 0, budgetUsed: 0, reserved: 0, remaining: 0 })
 })
 
 test('a Mission that used up its budget is refused at the next due time', async t => {
@@ -74,7 +74,7 @@ test('a Mission that used up its budget is refused at the next due time', async 
   assert.equal(harness.host.created.length, 1, 'the second Run never created a Session')
   assert.equal(harness.host.prompts.length, 2, 'and never prompted')
   assert.equal(harness.missions.get(mission.id).budgetUsed, 100, 'an exhausted Run spends nothing')
-  assert.deepEqual({ ...execution.runs.get(second.id).budget }, { budget: 100, budgetUsed: 100, remaining: 0 })
+  assert.deepEqual({ ...execution.runs.get(second.id).budget }, { budget: 100, budgetUsed: 100, reserved: 0, remaining: 0 })
 })
 
 test('a Run that overshoots its reservation still delivers and records the overspend', async t => {
@@ -110,7 +110,7 @@ test('a Run that overshoots its reservation still delivers and records the overs
   assert.match(note, /persisted and delivered/)
 
   assert.equal(harness.missions.get(mission.id).budgetUsed, 1_800, 'the real spend is settled')
-  assert.deepEqual({ ...run.budget }, { budget: 1_000, budgetUsed: 1_800, remaining: -800 })
+  assert.deepEqual({ ...run.budget }, { budget: 1_000, budgetUsed: 1_800, reserved: 0, remaining: -800 })
   assert.equal(harness.missions.get(mission.id).status, 'active')
 
   // The overspend shuts the gate for the next Run: it ends exhausted with no call.
@@ -208,7 +208,7 @@ test('a null budget has no gate and still accumulates usage', async t => {
   const run = execution.runs.get(report.enqueued[0])
   assert.equal(run.deliverables.length, 1)
   assert.equal(harness.missions.get(mission.id).budgetUsed, 10_000)
-  assert.deepEqual({ ...run.budget }, { budget: null, budgetUsed: 10_000, remaining: null })
+  assert.deepEqual({ ...run.budget }, { budget: null, budgetUsed: 10_000, reserved: 0, remaining: null })
   assert.equal(harness.host.prompts.filter(request => request.sessionId === CHIEF_SESSION).length, 1)
 })
 
@@ -263,6 +263,6 @@ test('the Run view carries the Mission budget on get and list', async t => {
 
   const listed = execution.runs.list({ missionId: mission.id })[0]
   assert.equal(listed.id, report.enqueued[0])
-  assert.deepEqual({ ...listed.budget }, { budget: 1_000, budgetUsed: 20, remaining: 980 })
-  assert.deepEqual({ ...execution.runs.get(listed.id).budget }, { budget: 1_000, budgetUsed: 20, remaining: 980 })
+  assert.deepEqual({ ...listed.budget }, { budget: 1_000, budgetUsed: 20, reserved: 0, remaining: 980 })
+  assert.deepEqual({ ...execution.runs.get(listed.id).budget }, { budget: 1_000, budgetUsed: 20, reserved: 0, remaining: 980 })
 })

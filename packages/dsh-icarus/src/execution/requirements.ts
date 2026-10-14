@@ -11,6 +11,11 @@
 // Semantic judgement (is the answer actually about the requirement) stays with the model,
 // from M3 on. A failed rule never rewrites the result: the caller stores the report and the
 // raw result as the failure record.
+import MarkdownIt from 'markdown-it'
+import { existsSync } from 'node:fs'
+import { isAbsolute } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
 export const MIN_RESULT_CHARS = 200
 
 export interface RequirementResult {
@@ -32,22 +37,39 @@ interface Heading {
   readonly line: number
 }
 
-const HEADING = /^(#{1,6})\s*(.+?)\s*$/
-const SOURCE_LINE = /^\s*(来源|source)\s*[:：]/i
-const LINK = /https?:\/\/\S+/i
+const markdown = new MarkdownIt({ linkify: true })
 
 const normalize = (text: string): string => text.replace(/\s+/g, ' ').trim().toLowerCase()
 
-function headingsOf(lines: readonly string[]): Heading[] {
+function headingsOf(text: string): Heading[] {
   const headings: Heading[] = []
-  lines.forEach((line, index) => {
-    const match = HEADING.exec(line)
-    if (match === null) return
-    const level = match[1]?.length ?? 1
-    const text = match[2] ?? ''
-    headings.push({ level, text, line: index })
+  const tokens = markdown.parse(text, {})
+  tokens.forEach((token, index) => {
+    if (token.type !== 'heading_open' || token.map === null) return
+    const content = tokens[index + 1]
+    const title = content?.children?.map(child => child.content).join('') ?? content?.content ?? ''
+    headings.push({ level: Number(token.tag.slice(1)), text: title, line: token.map[0] })
   })
   return headings
+}
+
+function hasSource(text: string, lines: readonly string[]): boolean {
+  const tokens = markdown.parse(text, {})
+  const link = tokens.some(token => token.children?.some(child => {
+    const href = child.type === 'link_open' ? child.attrGet('href') : null
+    if (typeof href !== 'string') return false
+    if (href.startsWith('https://') || href.startsWith('http://')) return true
+    if (href.startsWith('file:')) return existsSync(fileURLToPath(href))
+    const path = decodeURIComponent(href)
+    return isAbsolute(path) && existsSync(path)
+  }))
+  const sourceLine = (line: string): boolean => {
+    const value = line.trim()
+    const marker = ['来源：', '来源:', 'source:', 'source：'].find(prefix => value.toLowerCase().startsWith(prefix))
+    return marker !== undefined && value.slice(marker.length).trim() !== ''
+  }
+  return link || lines.some(sourceLine) || tokens.some(token => token.type === 'inline'
+    && sourceLine(token.children?.map(child => child.content).join('') ?? token.content))
 }
 
 export function checkDeliverable(text: string, requirements: readonly string[]): CheckReport {
@@ -58,12 +80,12 @@ export function checkDeliverable(text: string, requirements: readonly string[]):
 
   if (body === '') failures.push('R1 non-empty: the result is empty')
   if (body.length < MIN_RESULT_CHARS) failures.push(`R2 length floor: ${body.length} of ${MIN_RESULT_CHARS} characters`)
-  if (!LINK.test(text) && !lines.some(line => SOURCE_LINE.test(line))) failures.push('R3 source marker: no http(s) link and no 来源: line')
+  if (!hasSource(text, lines)) failures.push('R3 source marker: no usable source reference')
 
-  const headings = headingsOf(lines)
+  const headings = headingsOf(text)
   for (const requirement of requirements) {
     const wanted = normalize(requirement)
-    const start = headings.findIndex(heading => normalize(heading.text).includes(wanted))
+    const start = headings.findIndex(heading => normalize(heading.text) === wanted)
     if (start === -1) {
       results.push({ requirement, passed: false, reason: 'R4 response: no heading carries this requirement' })
       failures.push(`R4 response: missing section for ${JSON.stringify(requirement)}`)

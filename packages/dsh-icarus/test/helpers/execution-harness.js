@@ -195,7 +195,7 @@ export function makeDue(database, missionId, at) {
 
 export function baseMission(overrides = {}) {
   return {
-    ownerBotId: 'session-bot-1',
+    ownerBotId: CHIEF_SESSION,
     kind: 'recurring',
     objective: 'arXiv cs.AI 每日摘要',
     requirements: ['含来源引用'],

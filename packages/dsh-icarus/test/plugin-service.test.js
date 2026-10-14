@@ -41,7 +41,7 @@ test('apply publishes ctx.icarus.missions and ctx.icarus.runs, then closes on un
   apply(ctx, { dshHome, demo: { onBoot: false } })
 
   assert.deepEqual([...provided.keys()], ['icarus'])
-  assert.deepEqual([...inject], ['sessionController', 'timer'])
+  assert.deepEqual([...inject], ['sessionController', 'timer', 'llm', 'sessions', 'sessionQuery', 'agents'])
   assert.match(String(logs[0]?.[0]), /icarus: loaded/)
   assert.deepEqual(effects.map(effect => effect.label), ['icarus: execution and storage'])
   assert.equal(intervals.length, 1)
@@ -63,7 +63,7 @@ test('apply publishes ctx.icarus.missions and ctx.icarus.runs, then closes on un
   const report = await service.runs.tick()
   assert.deepEqual({ ...report, at: 0 }, { at: 0, enqueued: [], outcomes: [], recovered: { superseded: [], requeued: [] }, errors: [] }, 'nothing is due yet')
 
-  for (const effect of effects.splice(0)) effect.dispose()
+  for (const effect of effects.splice(0)) await effect.dispose()
   assert.throws(() => service.missions.list(), /database is not open/)
   assert.throws(() => service.runs.list(), /database is not open/)
   rmSync(join(dshHome, 'icarus'), { recursive: true, force: true })

@@ -62,7 +62,10 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
   function renewLeases(): void {
     for (const runId of executor.active()) {
       try {
-        store.renew(runId, options.instanceId, leaseMs)
+        if (!store.renew(runId, options.instanceId, leaseMs)) {
+          executor.leaseLost?.(runId)
+          logger.warn('icarus: stopped Run %s after losing its lease', runId)
+        }
       } catch (error) {
         logger.warn('icarus: could not renew the lease of Run %s: %s', runId, errorText(error))
       }
@@ -92,6 +95,7 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
     // Renewal first: this instance's own live Runs keep their lease, so the recovery that follows
     // cannot take a Run away from an executor that is still working on it.
     renewLeases()
+    await executor.recover?.()
     const recovered = runRecovery()
 
     for (const missionId of dueMissionIds()) {

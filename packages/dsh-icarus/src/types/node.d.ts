@@ -1,6 +1,4 @@
-// Ambient declarations for the Node.js built-ins Icarus uses. The M1 plan keeps
-// `typescript` as the only devDependency, so @types/node is deliberately absent and
-// this file describes exactly the surface the plugin touches — no more.
+// Icarus 使用的 Node.js 内置接口声明。
 declare const process: { readonly env: Record<string, string | undefined> }
 
 declare module 'node:fs/promises' {
@@ -17,10 +15,15 @@ declare module 'node:fs' {
 }
 
 declare module 'node:path' {
+  export function isAbsolute(path: string): boolean
   export function join(...parts: string[]): string
   export function dirname(path: string): string
   export function resolve(...parts: string[]): string
   export const sep: string
+}
+
+declare module 'node:url' {
+  export function fileURLToPath(url: string): string
 }
 
 declare module 'node:os' {
@@ -36,6 +39,17 @@ declare module 'node:crypto' {
   export function createHash(algorithm: string): Hash
 }
 
+declare module 'node:buffer' {
+  export const Buffer: { byteLength(value: string, encoding: 'utf8'): number }
+}
+
+declare module 'node:async_hooks' {
+  export class AsyncLocalStorage<T> {
+    getStore(): T | undefined
+    run<R>(store: T, callback: () => R): R
+  }
+}
+
 declare class TimerHandle {
   private readonly brand: 'TimerHandle'
 }
@@ -45,6 +59,7 @@ declare function clearTimeout(handle: TimerHandle): void
 declare class AbortSignal {
   readonly aborted: boolean
   readonly reason: unknown
+  throwIfAborted(): void
   static timeout(milliseconds: number): AbortSignal
   static any(signals: readonly AbortSignal[]): AbortSignal
 }
