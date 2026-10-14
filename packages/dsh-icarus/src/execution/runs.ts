@@ -13,6 +13,14 @@
 // Any failure marks the Run `superseded` (only while the lease is still ours) and the result
 // is discarded. Startup recovery handles Runs whose owner died: an expired lease becomes
 // `superseded` plus a fresh `queued` Run at the Mission's current revision.
+//
+// budget — every terminal transition writes the Run's status and adds its settled spend to
+// `Mission.budgetUsed` in ONE transaction, and only the transaction that actually changed the
+// status settles. That gives settlement exactly-once per Run without a marker column: the
+// conditional `UPDATE ... WHERE status = 'running'` (or the live-status update on the
+// supersede path) can succeed only once, and a second attempt changes nothing and settles
+// nothing. Spend is input + output tokens; cache read/write stay recorded in `usage` but do
+// not count against the cap.
 import { newId as mintId } from '../domain/ids.js'
 import { inTransaction } from '../domain/index.js'
 import { nextDueAt } from '../domain/schedule.js'
@@ -30,6 +38,12 @@ export interface TokenUsage {
   readonly cacheReadTokens?: number | undefined
   readonly cacheWriteTokens?: number | undefined
   readonly reasoningTokens?: number | undefined
+}
+
+/** Tokens a Mission's budget is charged for: input plus output only. */
+export function spentTokens(usage: TokenUsage | null): number {
+  if (usage === null) return 0
+  return usage.inputTokens + usage.outputTokens
 }
 
 export interface Run {
@@ -74,7 +88,17 @@ export interface DeliverableView {
   readonly outbox: readonly OutboxView[]
 }
 
-export type RunView = Run & { readonly deliverables: readonly DeliverableView[] }
+export type RunView = Run & {
+  readonly deliverables: readonly DeliverableView[]
+  /** The owning Mission's budget, assembled for readers; `remaining` may go negative after an overspend. */
+  readonly budget: RunBudgetView
+}
+
+export interface RunBudgetView {
+  readonly budget: number | null
+  readonly budgetUsed: number
+  readonly remaining: number | null
+}
 
 export interface CommitInput {
   readonly deliverable: {
@@ -123,9 +147,11 @@ export interface RunStore {
   attachSession(runId: string, instanceId: string, sessionId: string): boolean
   /** The Run, or a SupersededError naming why it may not commit. */
   committable(runId: string, instanceId: string): Run
-  /** Terminal failure of a claimed Run; the generation guard still applies. */
-  finish(runId: string, instanceId: string, outcome: { readonly status: 'failed' | 'cancelled'; readonly usage: TokenUsage | null; readonly errorRef?: string | null }): Run
-  /** Persist the deliverable and its pending Outbox row, and mark the Run succeeded. */
+  /** Terminal outcome of a claimed Run; the generation guard still applies. Settles the spend. */
+  finish(runId: string, instanceId: string, outcome: { readonly status: 'failed' | 'cancelled' | 'budget_exhausted'; readonly usage: TokenUsage | null; readonly errorRef?: string | null }): Run
+  /** Persist usage accumulated so far, so a Run superseded mid-flight still settles what it spent. */
+  recordUsage(runId: string, instanceId: string, usage: TokenUsage | null): boolean
+  /** Persist the deliverable and its pending Outbox row, mark the Run succeeded and settle. */
   commit(runId: string, instanceId: string, input: CommitInput): CommitResult
   /** Mark a Run superseded while this instance still owns it. */
   markSuperseded(runId: string, instanceId: string): boolean
@@ -218,12 +244,32 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
     return id
   }
 
-  /** Supersede a Run. Without an instance id every live status is eligible (recovery path). */
+  /**
+   * Supersede a Run and settle what it spent. Never opens its own transaction: callers
+   * already hold one (claim, recovery) or wrap the call (committable).
+   */
   function supersedeRow(runId: string, instanceId: string | null, at: number): number {
+    const row = db.prepare('SELECT missionId, usage FROM Run WHERE id = ?').get<{ missionId: string; usage: string | null }>(runId)
+    if (row === undefined) return 0
     const result = instanceId === null
       ? db.prepare(`UPDATE Run SET status = 'superseded', endedAt = ? WHERE id = ? AND status IN ('queued', 'running', 'awaiting_approval')`).run(at, runId)
       : db.prepare(`UPDATE Run SET status = 'superseded', endedAt = ? WHERE id = ? AND status = 'running' AND leaseOwner = ?`).run(at, runId, instanceId)
-    return Number(result.changes)
+    const changes = Number(result.changes)
+    if (changes > 0) settle(row.missionId, row.usage)
+    return changes
+  }
+
+  /** Add one Run's settled spend to the Mission. Must run inside the transition's transaction. */
+  function settle(missionId: string, usage: string | null): void {
+    const spend = spentTokens(usage === null ? null : (JSON.parse(usage) as TokenUsage))
+    if (spend === 0) return
+    db.prepare('UPDATE Mission SET budgetUsed = budgetUsed + ? WHERE id = ?').run(spend, missionId)
+  }
+
+  function budgetOf(missionId: string): RunBudgetView {
+    const row = db.prepare('SELECT budget, budgetUsed FROM Mission WHERE id = ?').get<{ budget: number | null; budgetUsed: number }>(missionId)
+    if (row === undefined) throw new Error(`icarus: Run points at missing Mission ${JSON.stringify(missionId)}`)
+    return { budget: row.budget, budgetUsed: row.budgetUsed, remaining: row.budget === null ? null : row.budget - row.budgetUsed }
   }
 
   function deliverablesOf(runId: string): DeliverableView[] {
@@ -247,7 +293,7 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
   }
 
   function view(row: RunRow): RunView {
-    return { ...toRun(row), deliverables: deliverablesOf(row.id) }
+    return { ...toRun(row), deliverables: deliverablesOf(row.id), budget: budgetOf(row.missionId) }
   }
 
   function enqueueDue(missionId: string): Run | null {
@@ -290,29 +336,47 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
     const row = rowOrThrow(runId)
     const at = now()
     if (row.status !== 'running' || row.leaseOwner !== instanceId || row.leaseUntil === null || row.leaseUntil <= at) {
-      supersedeRow(runId, instanceId, at)
+      // Superseding settles too, so it commits before the refusal is raised.
+      inTransaction(database, () => {
+        supersedeRow(runId, instanceId, at)
+      })
       throw new SupersededError(runId, `the lease is not held by ${instanceId} or has expired`)
     }
     const mission = options.missions.get(row.missionId)
     if (mission.revision !== row.missionRevision) {
-      supersedeRow(runId, instanceId, at)
+      inTransaction(database, () => {
+        supersedeRow(runId, instanceId, at)
+      })
       throw new SupersededError(runId, `Mission revision is ${mission.revision}, the Run was created for ${row.missionRevision}`)
     }
     return toRun(row)
   }
 
-  function finish(runId: string, instanceId: string, outcome: { readonly status: 'failed' | 'cancelled'; readonly usage: TokenUsage | null; readonly errorRef?: string | null }): Run {
+  function recordUsage(runId: string, instanceId: string, usage: TokenUsage | null): boolean {
+    const result = db.prepare(`UPDATE Run SET usage = ? WHERE id = ? AND status = 'running' AND leaseOwner = ?`)
+      .run(usage === null ? null : JSON.stringify(usage), runId, instanceId)
+    return Number(result.changes) > 0
+  }
+
+  function finish(runId: string, instanceId: string, outcome: { readonly status: 'failed' | 'cancelled' | 'budget_exhausted'; readonly usage: TokenUsage | null; readonly errorRef?: string | null }): Run {
     committable(runId, instanceId)
-    const result = db.prepare(`UPDATE Run SET status = ?, usage = ?, errorRef = ?, endedAt = ? WHERE id = ? AND status = 'running'`)
-      .run(outcome.status, outcome.usage === null ? null : JSON.stringify(outcome.usage), outcome.errorRef ?? null, now(), runId)
-    if (Number(result.changes) === 0) throw new SupersededError(runId, 'the Run is no longer running')
-    return toRun(rowOrThrow(runId))
+    const at = now()
+    return inTransaction(database, () => {
+      const missionId = rowOrThrow(runId).missionId
+      const result = db.prepare(`UPDATE Run SET status = ?, usage = ?, errorRef = ?, endedAt = ? WHERE id = ? AND status = 'running' AND leaseOwner = ?`)
+        .run(outcome.status, outcome.usage === null ? null : JSON.stringify(outcome.usage), outcome.errorRef ?? null, at, runId, instanceId)
+      // Only the transaction that actually ended the Run charges the Mission.
+      if (Number(result.changes) === 0) throw new SupersededError(runId, 'the Run is no longer running')
+      settle(missionId, outcome.usage === null ? null : JSON.stringify(outcome.usage))
+      return toRun(rowOrThrow(runId))
+    })
   }
 
   function commit(runId: string, instanceId: string, input: CommitInput): CommitResult {
     committable(runId, instanceId)
     const at = now()
     inTransaction(database, () => {
+      const missionId = rowOrThrow(runId).missionId
       db.prepare(`INSERT INTO Deliverable (id, runId, requirementResults, evidenceRefs, artifactRefs, content, contentHash, createdAt)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(
@@ -328,9 +392,10 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
       db.prepare(`INSERT INTO Outbox (id, deliverableId, channel, destinationRef, status, attemptCount, receiptRef, nextAttemptAt, createdAt, updatedAt)
         VALUES (?, ?, ?, NULL, 'pending', 0, NULL, NULL, ?, ?)`)
         .run(input.outboxId, input.deliverable.id, input.channel, at, at)
-      const result = db.prepare(`UPDATE Run SET status = 'succeeded', usage = ?, endedAt = ? WHERE id = ? AND status = 'running'`)
-        .run(input.usage === null ? null : JSON.stringify(input.usage), at, runId)
+      const result = db.prepare(`UPDATE Run SET status = 'succeeded', usage = ?, endedAt = ? WHERE id = ? AND status = 'running' AND leaseOwner = ?`)
+        .run(input.usage === null ? null : JSON.stringify(input.usage), at, runId, instanceId)
       if (Number(result.changes) === 0) throw new SupersededError(runId, 'the Run stopped running before its deliverable was persisted')
+      settle(missionId, input.usage === null ? null : JSON.stringify(input.usage))
     })
     return { deliverableId: input.deliverable.id, outboxId: input.outboxId }
   }
@@ -383,8 +448,9 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
     attachSession: (runId, instanceId, sessionId) => Number(db.prepare(`UPDATE Run SET sessionId = ? WHERE id = ? AND status = 'running' AND leaseOwner = ?`).run(sessionId, runId, instanceId).changes) > 0,
     committable,
     finish,
+    recordUsage,
     commit,
-    markSuperseded: (runId, instanceId) => supersedeRow(runId, instanceId, now()) > 0,
+    markSuperseded: (runId, instanceId) => inTransaction(database, () => supersedeRow(runId, instanceId, now()) > 0),
     recoverExpired,
     get,
     list,

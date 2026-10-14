@@ -18,8 +18,8 @@ import { wallClockOf } from '../domain/timezone.js'
 import { absoluteArtifactPath, artifactRef, contentHash, writeArtifact } from './artifacts.js'
 import { OUTBOX_CHANNEL_BOT } from './outbox.js'
 import { MIN_RESULT_CHARS, checkDeliverable } from './requirements.js'
-import { SupersededError } from './runs.js'
-import type { MissionRevision, MissionService } from '../domain/index.js'
+import { SupersededError, spentTokens } from './runs.js'
+import type { Mission, MissionRevision, MissionService } from '../domain/index.js'
 import type { IcarusDatabase, IcarusPaths } from '../storage/index.js'
 import type { IcarusContext, SessionEventLike } from '../types/host.js'
 import type { OutboxService } from './outbox.js'
@@ -30,7 +30,7 @@ export const DEFAULT_EXECUTION_TIMEOUT_MS = 10 * 60_000
 export const DEFAULT_DELIVERY_MAX_CHARS = 4_000
 const MAX_EVIDENCE_LINKS = 20
 
-export type ExecutionStatus = 'succeeded' | 'failed' | 'cancelled' | 'superseded' | 'abandoned' | 'skipped'
+export type ExecutionStatus = 'succeeded' | 'failed' | 'cancelled' | 'superseded' | 'budget_exhausted' | 'abandoned' | 'skipped'
 
 export interface ExecutionOutcome {
   readonly runId: string
@@ -67,6 +67,26 @@ interface FailureRecord {
   readonly message: string
   readonly status?: number | undefined
   readonly requestId?: string | undefined
+}
+
+/**
+ * The Mission's budget at the moment a Run is claimed: the hard cap, what has been settled,
+ * what this Run may therefore spend, and whether the gate is already shut. `reserved` is the
+ * Run's own cap for the whole attempt (in memory only: with one execution at a time there is
+ * nothing to publish, and M4's concurrency is what will need a persisted reservation).
+ */
+interface BudgetState {
+  readonly budget: number | null
+  readonly budgetUsed: number
+  readonly reserved: number | null
+  readonly exhausted: boolean
+}
+
+/** What a Run spent past the budget it had left; recorded, never used to discard the result. */
+interface BudgetOvershoot {
+  readonly reserved: number
+  readonly spent: number
+  readonly over: number
 }
 
 type TurnEnd =
@@ -138,7 +158,17 @@ export function createExecutor(options: ExecutorOptions): Executor {
       const text = textOfMessage(event)
       if (text !== '') turn.texts.push(text)
       const usage = usageOfEvent(event)
-      if (usage !== null) turn.usage = addUsage(turn.usage, usage)
+      if (usage !== null) {
+        turn.usage = addUsage(turn.usage, usage)
+        try {
+          // Progress, not the final word: a Run superseded or killed mid-flight must still
+          // settle what it actually spent. A failed progress write must not break the host's
+          // event dispatch, so it only warns.
+          store.recordUsage(turn.runId, options.instanceId, turn.usage)
+        } catch (error) {
+          ctx.logger.warn('icarus: could not record partial usage for Run %s: %s', turn.runId, errorText(error))
+        }
+      }
       return
     }
     if (event.type === 'turn/end') turn.settle(endOfEvent(event))
@@ -194,6 +224,59 @@ export function createExecutor(options: ExecutorOptions): Executor {
     return { runId: run.id, status: 'failed', detail }
   }
 
+  /** Budget of the Mission as the Run claims it. Read live: the cap is the current one, not the pinned revision's. */
+  function budgetStateOf(mission: Mission): BudgetState {
+    return {
+      budget: mission.budget,
+      budgetUsed: mission.budgetUsed,
+      reserved: mission.budget === null ? null : mission.budget - mission.budgetUsed,
+      exhausted: mission.budget !== null && mission.budgetUsed >= mission.budget,
+    }
+  }
+
+  /**
+   * The budget record left in `artifacts/`, one file per Run with two distinguishable kinds:
+   * `budget-exhausted` is the gate refusing a Run before any model call,
+   * `budget-overrun` is a Run that spent past what the Mission had left and still delivered.
+   */
+  function budgetNote(run: Run, gate: BudgetState, kind: 'exhausted' | 'overrun', spent: number): string {
+    const overshoot = kind === 'overrun' && gate.reserved !== null ? Math.max(0, spent - gate.reserved) : 0
+    return [
+      kind === 'exhausted' ? `Icarus Run ${run.id} was refused on budget` : `Icarus Run ${run.id} overspent the remaining budget`,
+      `time: ${new Date(now()).toISOString()}`,
+      `kind: ${kind === 'exhausted' ? 'budget-exhausted' : 'budget-overrun'}`,
+      `mission: ${run.missionId} revision ${run.missionRevision} generation ${run.generation}`,
+      `budget: ${gate.budget ?? 'none'}`,
+      `budgetUsed at claim: ${gate.budgetUsed}`,
+      `reserved (remaining at claim): ${gate.reserved ?? 'none'}`,
+      `spent this run: ${spent} tokens (input + output; cache read/write is recorded but not charged)`,
+      `overshoot: ${overshoot}`,
+      '',
+      kind === 'exhausted'
+        ? 'no model call was made: the Mission had no remaining budget when the Run was claimed, and the gate refuses every later Run until the budget is raised'
+        : 'the turn finished, the requirement check passed and the result was persisted and delivered; the overspend is settled into Mission.budgetUsed, which shuts the gate for every later Run',
+    ].join('\n')
+  }
+
+  /** Write the budget note and return its artifact ref. */
+  function writeBudgetNote(run: Run, gate: BudgetState, kind: 'exhausted' | 'overrun', spent: number): string {
+    const ref = artifactRef('runs', run.id, 'budget.txt')
+    writeArtifact(paths, ref, budgetNote(run, gate, kind, spent))
+    return ref
+  }
+
+  /** Gate shut before any model call: the Run ends exhausted without creating a Session. */
+  function exhaust(run: Run, gate: BudgetState, detail: string): ExecutionOutcome {
+    const ref = writeBudgetNote(run, gate, 'exhausted', 0)
+    try {
+      store.finish(run.id, options.instanceId, { status: 'budget_exhausted', usage: null, errorRef: ref })
+    } catch (error) {
+      if (error instanceof SupersededError) return { runId: run.id, status: 'superseded', detail: error.reason }
+      throw error
+    }
+    return { runId: run.id, status: 'budget_exhausted', detail }
+  }
+
   function promptOf(revision: MissionRevision, run: Run): string {
     const wall = wallClockOf(now(), revision.timezone)
     const pad = (value: number): string => String(value).padStart(2, '0')
@@ -219,13 +302,16 @@ export function createExecutor(options: ExecutorOptions): Executor {
     return lines.join('\n')
   }
 
-  function deliverableText(text: string, ref: string, run: Run): string {
+  function deliverableText(text: string, ref: string, run: Run, overshoot: BudgetOvershoot | null): string {
     const full = absoluteArtifactPath(paths, ref)
     const body = text.length <= deliveryMaxChars ? text : `${text.slice(0, deliveryMaxChars)}\n\n…（正文共 ${text.length} 字，完整内容见 ${full}）`
-    return `${body}\n\n— Icarus｜Run ${run.id}｜Mission ${run.missionId} revision ${run.missionRevision}｜正文 ${text.length} 字｜完整记录：${full}`
+    const budget = overshoot === null
+      ? ''
+      : `\n\n⚠ 本次执行超出剩余预算：可用 ${overshoot.reserved} tokens，实际 ${overshoot.spent}（超出 ${overshoot.over}）；Mission 累计用量已更新，后续 Run 会被预算闸门拦下。`
+    return `${body}${budget}\n\n— Icarus｜Run ${run.id}｜Mission ${run.missionId} revision ${run.missionRevision}｜正文 ${text.length} 字｜完整记录：${full}`
   }
 
-  async function complete(run: Run, turn: TurnTracker): Promise<ExecutionOutcome> {
+  async function complete(run: Run, turn: TurnTracker, gate: BudgetState): Promise<ExecutionOutcome> {
     const text = turn.texts.join('\n\n').trim()
     if (missions.get(run.missionId).status === 'cancelled') {
       store.finish(run.id, options.instanceId, { status: 'cancelled', usage: turn.usage, errorRef: null })
@@ -234,15 +320,26 @@ export function createExecutor(options: ExecutorOptions): Executor {
     const revision = snapshotOf(run.missionId, run.missionRevision)
     const check = checkDeliverable(text, revision.requirements)
     if (!check.passed) return fail(run, turn.usage, 'requirement-check', check.failures.join('; '), { text, check })
+    // Spending past the remaining budget is recorded on the Run and in the delivered text, and
+    // it settles into Mission.budgetUsed — which is what shuts the gate for every later Run.
+    // The result itself is never destroyed: by the time this is known, the call is paid for.
+    const spent = spentTokens(turn.usage)
+    const overshoot = gate.reserved !== null && spent > gate.reserved
+      ? { reserved: gate.reserved, spent, over: spent - gate.reserved }
+      : null
+    if (overshoot !== null) {
+      ctx.logger.warn('icarus: Run %s spent %d tokens of the %d reserved for Mission %s', run.id, spent, overshoot.reserved, run.missionId)
+    }
+    const budgetRef = overshoot === null ? null : writeBudgetNote(run, gate, 'overrun', spent)
     const bodyRef = artifactRef('runs', run.id, 'deliverable.md')
     writeArtifact(paths, bodyRef, text)
     const commit = store.commit(run.id, options.instanceId, {
       deliverable: {
         id: newId('deliverable'),
-        content: deliverableText(text, bodyRef, run),
+        content: deliverableText(text, bodyRef, run, overshoot),
         contentHash: contentHash(text),
         requirementResults: check,
-        artifactRefs: [bodyRef],
+        artifactRefs: budgetRef === null ? [bodyRef] : [bodyRef, budgetRef],
         evidenceRefs: linksOf(text),
       },
       outboxId: newId('outbox'),
@@ -270,6 +367,11 @@ export function createExecutor(options: ExecutorOptions): Executor {
     }
     let turn: TurnTracker | undefined
     try {
+      // Gate first: no Session, no prompt, no model call when the Mission has nothing left.
+      const gate = budgetStateOf(missions.get(claimed.missionId))
+      if (gate.exhausted) {
+        return exhaust(claimed, gate, `no remaining budget (${gate.budgetUsed} of ${gate.budget} settled)`)
+      }
       const created = await ctx.sessionController.create({ cwd: paths.workspaceDir })
       store.attachSession(runId, options.instanceId, created.sessionId)
       turn = new TurnTracker(created.sessionId, runId)
@@ -287,7 +389,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
       if (end.kind === 'timeout') return fail(claimed, turn.usage, 'turn-timeout', `no turn/end within ${timeoutMs} ms`, { sessionId: turn.sessionId })
       if (end.kind === 'ended') return fail(claimed, turn.usage, 'turn-ended', `turn ended with reason ${end.reason}`, { sessionId: turn.sessionId, reason: end.reason })
       if (end.kind === 'error') return fail(claimed, turn.usage, 'turn-error', end.failure.message, { sessionId: turn.sessionId, failure: end.failure })
-      return await complete(claimed, turn)
+      return await complete(claimed, turn, gate)
     } catch (error) {
       if (disposed) return { runId, status: 'abandoned', detail: 'the plugin unloaded during the Run' }
       if (error instanceof SupersededError) return { runId, status: 'superseded', detail: error.reason }

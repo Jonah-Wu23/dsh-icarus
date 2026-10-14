@@ -113,6 +113,9 @@ M2.4 依赖 M2.3 的执行器收口；M2.5 依赖 M2.3 的执行会话。M2.3 �
 - `ctx.icarus` 服务面：`ctx.provide('icarus', { missions })`，其他插件 `inject: ['icarus']` 取用；已用宿主 cordis 4.0.4 实测该机制成立。
 - 交付后状态入口为 `missions.recordDelivery(id)`；防重复交付靠 Outbox 状态，不靠状态机。
 - 代次校验用 `revision`，不用 `updatedAt`（pause/resume 也改 updatedAt）。
+- **预留在内存，不落库**：M2.4 的预留 = claim 时读到的 `budget - budgetUsed`，只作为本次 Run 的可用上限存在执行器内存里，没有 `Run.budgetReserved` 列。理由：M2.3 串行执行，没有并发方需要看见这份预留；落库反而会给人"闸门已考虑预留"的错觉。M4 做并发时按此接缝补齐——0002 迁移加 `Run.budgetReserved`，闸门从 `budgetUsed >= budget` 改成 `budgetUsed + 活跃预留 >= budget`，并在结算时释放预留。
+- **无估算式预留（留 M4）**：闸门只看已结算量（`budgetUsed >= budget` → 零调用），不做"输入规模估算 + 用户设定的最大输出"的预检。真正的预留式闸门需要先有估算策略与用户可配的上限，属 M4 并发+预算策略，M2.4 不擅自加参数。
+- **超支不销毁成果（拍板）**：超上限判定发生在模型调用之后（token 已消耗），因此 M2.4 采取"超上限照常核对、落库、投递，Run 记 `succeeded`，真实用量结算进 `budgetUsed`"。上限阻止的是新增调用（claim 闸门），不是已付费的交付。超支后 `budgetUsed > budget`、Run 视图 `remaining` 为负，超支记录在 `runs/<id>/budget.txt`（`kind: budget-overrun`，含 reserved/spent/overshoot），并在交付文本里显式提示；闸门在下一个 Run 生效。`runs/<id>/budget.txt` 的另一种是 `kind: budget-exhausted`（闸门拒绝，零调用）。
 
 ## 3. M2 总验收（联调，真实宿主）
 
