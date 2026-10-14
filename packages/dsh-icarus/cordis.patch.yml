@@ -1,0 +1,10 @@
+# Mounts the Icarus host plugin. `demo.onBoot` runs the M1 demonstration delivery
+# once per plugin load: one real arXiv cs.AI fetch, delivered to the Bot below
+# through BotBridge. Override this row's config in the profile patch to turn it off.
+- insert:
+    - id: icarus
+      name: dsh-icarus
+      config:
+        bot: Chief
+        demo:
+          onBoot: true

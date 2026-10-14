@@ -1,0 +1,36 @@
+{
+  "name": "dsh-icarus",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Icarus: persistent commissions and evidence-backed curation on DeepSeek Harness",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/",
+    "cordis.patch.yml"
+  ],
+  "meta": {
+    "title": "Icarus",
+    "description": "持续委托与证据化策展（M1：BotBridge 与演示交付）"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

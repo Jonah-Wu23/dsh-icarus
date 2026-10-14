@@ -1,0 +1,6 @@
+# The profile supplies Icarus's peer dependency (@deepseek-ai/cordis) at run time,
+# so this package never installs peers of its own. Mirrors the desktop profile setting.
+packages:
+  - .
+
+autoInstallPeers: false
