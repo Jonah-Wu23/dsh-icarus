@@ -5,8 +5,9 @@
 // conversation moves to a fresh Session; `bot.id` is the first segment's Session id and
 // never changes. Reading the file is atomic-safe on the writer's side (lock plus rename).
 import { readFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
+import { dshHomeOf } from '../dsh-home.js'
+import type { DshHomeOptions } from '../dsh-home.js'
 
 export interface BotIdentity {
   /** Stable Bot id: the Session id of the Bot's first own-chat segment. */
@@ -16,11 +17,7 @@ export interface BotIdentity {
   readonly name: string
 }
 
-export interface IdentityOptions {
-  /** DSH home directory; defaults to `$DSH_HOME`, then `~/.dsh`. */
-  readonly dshHome?: string | undefined
-  readonly env?: Record<string, string | undefined> | undefined
-}
+export type IdentityOptions = DshHomeOptions
 
 interface StoredBot {
   readonly id?: unknown
@@ -35,10 +32,7 @@ interface StoredState {
 
 /** Path of the Bot state file for a DSH home. */
 export function statePathOf(options: IdentityOptions = {}): string {
-  const env = options.env ?? process.env
-  const configured = options.dshHome ?? env.DSH_HOME
-  const home = configured !== undefined && configured.trim() !== '' ? resolve(configured.trim()) : join(homedir(), '.dsh')
-  return join(home, 'bot', 'state.json')
+  return join(dshHomeOf(options), 'bot', 'state.json')
 }
 
 /**

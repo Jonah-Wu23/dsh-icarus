@@ -7,9 +7,17 @@ declare module 'node:fs/promises' {
   export function readFile(path: string, encoding: 'utf8'): Promise<string>
 }
 
+declare module 'node:fs' {
+  export function mkdirSync(path: string, options?: { recursive?: boolean }): string | undefined
+  export function existsSync(path: string): boolean
+  export function statSync(path: string): { isFile(): boolean }
+  export function rmSync(path: string, options?: { force?: boolean; recursive?: boolean }): void
+}
+
 declare module 'node:path' {
   export function join(...parts: string[]): string
   export function resolve(...parts: string[]): string
+  export const sep: string
 }
 
 declare module 'node:os' {
@@ -43,3 +51,32 @@ declare function fetch(
   url: string,
   init?: { readonly signal?: AbortSignal | undefined; readonly headers?: Record<string, string> | undefined },
 ): Promise<Response>
+
+// node:sqlite (built into Node 24; the desktop runtime is 24.18.1). Statically linked,
+// no native addon and no npm dependency.
+declare module 'node:sqlite' {
+  export interface RunResult {
+    readonly changes: number | bigint
+    readonly lastInsertRowid: number | bigint
+  }
+
+  export interface StatementSync {
+    run(...params: unknown[]): RunResult
+    get<T = Record<string, unknown>>(...params: unknown[]): T | undefined
+    all<T = Record<string, unknown>>(...params: unknown[]): T[]
+  }
+
+  export interface DatabaseSyncOptions {
+    readonly open?: boolean
+    readonly readOnly?: boolean
+    readonly enableForeignKeyConstraints?: boolean
+    readonly timeout?: number
+  }
+
+  export class DatabaseSync {
+    constructor(location: string, options?: DatabaseSyncOptions)
+    exec(sql: string): void
+    prepare(sql: string): StatementSync
+    close(): void
+  }
+}
