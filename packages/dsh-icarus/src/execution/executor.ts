@@ -6,11 +6,18 @@ import { errorText } from '../bridge/deliver.js'
 import { newId as mintId } from '../domain/ids.js'
 import { parseSchedule } from '../domain/schedule.js'
 import { wallClockOf } from '../domain/timezone.js'
-import { absoluteArtifactPath, artifactRef, contentHash, writeArtifact } from './artifacts.js'
+import { absoluteArtifactPath, artifactRef, contentHash, readArtifact, writeArtifact } from './artifacts.js'
 import { OUTBOX_CHANNEL_BOT } from './outbox.js'
-import { MIN_RESULT_CHARS, checkDeliverable } from './requirements.js'
+import { checkDeliverable, modelJson } from './requirements.js'
 import { APPROVAL_OUTCOMES, SupersededError, spentTokens } from './runs.js'
-import { DEFAULT_MAX_OUTPUT_TOKENS, installModelBudget } from './model-budget.js'
+import { BudgetExhaustedError, DEFAULT_MAX_OUTPUT_TOKENS, installModelBudget, modelCallUsage } from './model-budget.js'
+import { parseBindings } from '../domain/bindings.js'
+import { PreparationBlockedError } from './curation.js'
+import type { MissionBindings } from '../domain/bindings.js'
+import type { CurationService } from './curation.js'
+import type { WindowService } from './windows.js'
+import type { CapabilityService } from '../capabilities/index.js'
+import type { FaultService } from './faults.js'
 import type { Mission, MissionRevision, MissionService } from '../domain/index.js'
 import type { IcarusDatabase, IcarusPaths } from '../storage/index.js'
 import type { IcarusContext, SessionEventLike } from '../types/host.js'
@@ -46,6 +53,10 @@ export interface Executor {
 }
 
 export interface ExecutorOptions {
+  readonly curation: CurationService
+  readonly windows: WindowService
+  readonly capabilities: CapabilityService
+  readonly faults: FaultService
   readonly maxOutputTokens?: number
   readonly userTokenBudget?: number | null
   readonly ctx: IcarusContext
@@ -174,6 +185,7 @@ class TurnTracker {
 }
 
 interface RevisionRow {
+  readonly bindings: string
   readonly missionId: string
   readonly revision: number
   readonly kind: string
@@ -194,6 +206,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
   const deliveryMaxChars = options.deliveryMaxChars ?? DEFAULT_DELIVERY_MAX_CHARS
   const { ctx, store, missions, paths } = options
   const turns = new Map<string, TurnTracker>()
+  const preparations = new Set<string>()
   /** Aborted on unload, so a prompt still being admitted does not outlive the plugin. */
   const unloading = new AbortController()
   let disposed = false
@@ -204,9 +217,45 @@ export function createExecutor(options: ExecutorOptions): Executor {
     maxOutputTokens: options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
     userTokenBudget: options.userTokenBudget ?? null,
     onBlocked: (runId, error, purpose) => {
-      if (purpose !== 'session-title' && [...turns.values()].some(turn => turn.runId === runId)) budgetFailures.set(runId, error)
+      if (purpose !== 'session-title' && (preparations.has(runId) || [...turns.values()].some(turn => turn.runId === runId))) budgetFailures.set(runId, error)
       else ctx.logger.warn('icarus: Run %s auxiliary request refused: %s', runId, error.message)
     },
+  })
+
+  const submissions = new Map<string, { readonly runId: string; readonly key: string; readonly validate: (value: unknown) => void }>()
+  ctx.tools.register({
+    name: 'icarus_submit_step',
+    description: '提交 Icarus 当前准备步骤的结构化结果。按本次步骤提供的结构填写 result；工具验证格式和证据引用，接受后结束回合。仅供当前 Icarus 执行会话调用。',
+    parameters: { type: 'object', properties: { result: { type: 'object', additionalProperties: true } }, required: ['result'], additionalProperties: false },
+    output: { schema: { type: 'object', properties: { accepted: { type: 'boolean' }, step: { type: 'string' } }, required: ['accepted', 'step'], additionalProperties: false },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args, exec) {
+      const submission = exec.agent === undefined ? undefined : submissions.get(exec.agent.id)
+      if (submission === undefined) throw new Error('icarus: no structured step is active in this Session')
+      store.committable(submission.runId, options.instanceId)
+      submission.validate(args.result)
+      const serialized = JSON.stringify(args.result)
+      const step = options.database.db.prepare('SELECT responseRef FROM RunStep WHERE runId = ? AND stepKey = ?').get<{ responseRef: string | null }>(submission.runId, submission.key)
+      if (step === undefined) throw new Error('icarus: active preparation step is not persisted')
+      if (step.responseRef !== null) {
+        if (readArtifact(paths, step.responseRef) !== serialized) throw new Error('icarus: this step already accepted a different result')
+      } else {
+        const ref = writeArtifact(paths, `runs/${submission.runId}/steps/${contentHash(submission.key)}-response.txt`, serialized)
+        options.database.db.prepare('UPDATE RunStep SET responseRef = ? WHERE runId = ? AND stepKey = ?').run(ref, submission.runId, submission.key)
+      }
+      return { accepted: true, step: submission.key }
+    },
+  })
+
+  ctx.on('tools/post-execute', async (request, result, next) => {
+    const decision = await next()
+    const turn = request.agent === undefined ? undefined : turns.get(request.agent.id)
+    if (turn === undefined || decision.kind !== 'accept' || Object.hasOwn(decision, 'value')) return decision
+    const run = store.get(turn.runId)
+    if (run.deliveryWindowId === null) return decision
+    const content = decision.content ?? result.content
+    const ref = options.capabilities.capture(run.missionId, run.id, request.agent!.id, request.callId, request.name, { ...result, content })
+    return { ...decision, content: [...content, { type: 'text', text: JSON.stringify({ icarusEvidence: { ref, scope: 'tool_result', truncated: null, isError: result.isError === true } }) }] }
   })
 
   ctx.on('session/event', (session, event) => {
@@ -238,6 +287,12 @@ export function createExecutor(options: ExecutorOptions): Executor {
       return
     }
     if (event.type === 'tool/result') {
+      const callId = stringOf(event.data?.callId)
+      const result = event.data?.result
+      if (callId !== null && isRecord(result) && Array.isArray(result.content)) {
+        const run = store.get(turn.runId)
+        options.capabilities.capture(run.missionId, run.id, sessionId, callId, turn.callNames.get(callId) ?? 'unknown', result as unknown as import('../types/host.js').ToolResult)
+      }
       // Any tool result ends a narration segment: what follows it is the closing answer.
       turn.sawToolResult()
       // A rejected or timed-out tool call lands here as an error result; it is the raw material
@@ -280,7 +335,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
 
   function snapshotOf(missionId: string, revision: number): MissionRevision {
     const row = options.database.db
-      .prepare(`SELECT missionId, revision, kind, objective, requirements, schedule, timezone, budget, authorizationRef, createdAt
+      .prepare(`SELECT missionId, revision, kind, objective, requirements, schedule, timezone, budget, authorizationRef, createdAt, bindings
         FROM MissionRevision WHERE missionId = ? AND revision = ?`)
       .get<RevisionRow>(missionId, revision)
     if (row === undefined) throw new Error(`icarus: Mission ${JSON.stringify(missionId)} has no revision ${revision} snapshot`)
@@ -288,6 +343,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
     const requirements = JSON.parse(row.requirements) as unknown
     if (!Array.isArray(requirements)) throw new Error(`icarus: MissionRevision ${missionId}@${revision} requirements are not an array`)
     return {
+      ...parseBindings(JSON.parse(row.bindings) as MissionBindings),
       missionId: row.missionId,
       revision: row.revision,
       kind: row.kind,
@@ -337,11 +393,15 @@ export function createExecutor(options: ExecutorOptions): Executor {
   }
 
   function fail(run: Run, turn: TurnTracker | null, kind: string, detail: string, raw: unknown): ExecutionOutcome {
+    run = store.get(run.id)
     store.committable(run.id, options.instanceId)
     const ref = artifactRef('runs', run.id, 'error.txt')
     writeArtifact(paths, ref, failureArchive(run, kind, detail, raw, turn))
     try {
       store.finish(run.id, options.instanceId, { status: 'failed', usage: turn?.usage ?? null, errorRef: ref })
+      if (run.deliveryWindowId !== null) options.windows.failed(run.deliveryWindowId, { kind, detail, errorRef: ref, at: now() })
+      if (kind !== 'sources') options.faults.record({ missionId: run.missionId, runId: run.id, kind, conditionKey: `preparation:${kind}`, errorRef: ref,
+        detail: { message: detail.split('\n')[0], detail: raw } })
     } catch (error) {
       if (error instanceof SupersededError) return { runId: run.id, status: 'superseded', detail: error.reason }
       throw error
@@ -395,6 +455,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
     const ref = writeBudgetNote(run, gate, 'exhausted', 0)
     try {
       store.finish(run.id, options.instanceId, { status: 'budget_exhausted', usage: null, errorRef: ref })
+      if (run.deliveryWindowId !== null) options.windows.failed(run.deliveryWindowId, { kind: 'budget_exhausted', errorRef: ref, at: now() })
     } catch (error) {
       if (error instanceof SupersededError) return { runId: run.id, status: 'superseded', detail: error.reason }
       throw error
@@ -413,14 +474,13 @@ export function createExecutor(options: ExecutorOptions): Executor {
       `执行标识：Run ${run.id}（Mission revision ${revision.revision}）`,
       `当前本地时间：${wall.year}-${pad(wall.month)}-${pad(wall.day)} ${pad(wall.hour)}:${pad(wall.minute)}（${revision.timezone}）`,
       '',
-      '必须逐条回应的要求。每条用一个 Markdown 二级标题「## <要求原文>」开头，标题下紧跟该条的回应正文：',
+      '请回应以下要求，按内容自然组织成果：',
     ]
     if (revision.requirements.length === 0) lines.push('（本次委托没有逐条要求，直接给出成果正文）')
     else revision.requirements.forEach((requirement, index) => lines.push(`${index + 1}. ${requirement}`))
     lines.push(
       '',
       '输出约束：',
-      `- 正文不少于 ${MIN_RESULT_CHARS} 字；`,
       '- 至少给出一个可访问的来源链接，或以「来源：」开头的来源列表；',
       '- 不要解释这些格式要求。',
     )
@@ -448,13 +508,16 @@ export function createExecutor(options: ExecutorOptions): Executor {
 
   async function complete(run: Run, turn: TurnTracker, gate: BudgetState): Promise<ExecutionOutcome> {
     store.committable(run.id, options.instanceId)
-    const text = turn.resultText()
+    const verificationStep = options.database.db.prepare('SELECT stepKey FROM RunStep WHERE runId = ? AND stepKey = ?').get(run.id, 'verify-legacy')
+    const text = verificationStep === undefined ? turn.resultText() : readArtifact(paths, `runs/${run.id}/candidate.md`)
+    writeArtifact(paths, `runs/${run.id}/candidate.md`, text)
     if (missions.get(run.missionId).status === 'cancelled') {
       store.finish(run.id, options.instanceId, { status: 'cancelled', usage: turn.usage, errorRef: null })
       return { runId: run.id, status: 'cancelled', detail: 'the Mission was cancelled while the Run was in flight' }
     }
     const revision = snapshotOf(run.missionId, run.missionRevision)
-    const check = checkDeliverable(text, revision.requirements)
+    const verification = await invokeStep(run, 'verify-legacy', `请核对成果是否满足用户目标及每项要求。\n目标：${revision.objective}\n要求：${JSON.stringify(revision.requirements)}\n成果：${text}\n实际证据：${JSON.stringify([...options.curation.evidenceFacts(run.id)].map(([ref, fact]) => ({ ref, ...fact })))}\n只返回 JSON：{"objective":{"passed":true,"reason":"具体判断依据","evidenceRefs":[]},"results":[{"requirement":"要求原文，按输入顺序","passed":true,"reason":"具体判断依据","evidenceRefs":[]}],"evidenceRefs":[],"readingClaims":[]}。判断不通过时 passed 为 false，并说明原因。引用只能使用上面的实际证据。`, now() + timeoutMs)
+    const check = checkDeliverable(text, revision.requirements, modelJson(verification), options.curation.evidenceFacts(run.id))
     if (!check.passed) return fail(run, turn, 'requirement-check', check.failures.join('; '), { text, check })
     // A refusal is recorded, never a reason to drop the result: the turn is over and the call is
     // paid for, so the delivery carries the refusal line instead of the result disappearing.
@@ -488,11 +551,111 @@ export function createExecutor(options: ExecutorOptions): Executor {
       channel: OUTBOX_CHANNEL_BOT,
       usage: turn.usage,
     })
-    const attempt = await options.outbox.attempt(commit.outboxId)
-    return { runId: run.id, status: 'succeeded', detail: `outbox ${attempt.status}` }
+    return { runId: run.id, status: 'succeeded', detail: `outbox pending ${commit.outboxId}` }
+  }
+
+  interface StepRow { readonly requestId: string; readonly promptRef: string; readonly responseRef: string | null }
+
+  function replayStep(events: readonly SessionEventLike[], requestId: string): { readonly started: boolean; readonly text?: string } {
+    const start = events.findIndex(event => event.type === 'user/message' && isRecord(event.data?.source) && event.data.source.rpcId === requestId)
+    if (start < 0) return { started: false }
+    const tracker = new TurnTracker('replay', 'replay')
+    for (const event of events.slice(start)) {
+      if (event.type === 'assistant/message') tracker.say(textOfMessage(event))
+      if (event.type === 'tool/result') tracker.sawToolResult()
+      if (event.type === 'turn/end') return endOfEvent(event).kind === 'completed' ? { started: true, text: tracker.resultText() } : { started: true }
+    }
+    return { started: true }
+  }
+
+  async function invokeStep(run: Run, key: string, prompt: string, deadline: number, validate?: (value: unknown) => void): Promise<string> {
+    run = store.get(run.id)
+    store.committable(run.id, options.instanceId)
+    if (run.sessionId === null) throw new Error('icarus: preparation step requires a Session')
+    const { db } = options.database
+    let step = db.prepare('SELECT requestId, promptRef, responseRef FROM RunStep WHERE runId = ? AND stepKey = ?').get<StepRow>(run.id, key)
+    if (step?.responseRef !== null && step?.responseRef !== undefined) return readArtifact(paths, step.responseRef)
+    if (step !== undefined) {
+      const observation = await ctx.sessionQuery.observeSession(run.sessionId, { projectionMode: 'none' })
+      try {
+        const replay = replayStep(observation.events, step.requestId)
+        if (replay.text !== undefined) {
+          const ref = writeArtifact(paths, `runs/${run.id}/steps/${contentHash(key)}-response.txt`, replay.text)
+          db.prepare('UPDATE RunStep SET responseRef = ?, completedAt = ? WHERE runId = ? AND stepKey = ?').run(ref, now(), run.id, key)
+          return replay.text
+        }
+        if (replay.started) throw new Error(`icarus: preparation step ${key} was interrupted; preserve its progress for a new attempt`)
+      } finally { observation[Symbol.dispose]() }
+      prompt = readArtifact(paths, step.promptRef)
+    } else {
+      const requestId = newId('step_prompt')
+      const promptRef = writeArtifact(paths, `runs/${run.id}/steps/${contentHash(key)}-prompt.txt`, prompt)
+      db.prepare('INSERT INTO RunStep(runId, stepKey, requestId, promptRef, createdAt) VALUES (?, ?, ?, ?, ?)').run(run.id, key, requestId, promptRef, now())
+      step = { requestId, promptRef, responseRef: null }
+    }
+    db.prepare('UPDATE Run SET phase = ? WHERE id = ?').run(key, run.id)
+    const tracker = new TurnTracker(run.sessionId, run.id)
+    turns.set(run.sessionId, tracker)
+    if (validate !== undefined) {
+      submissions.set(run.sessionId, { runId: run.id, key, validate })
+      prompt += '\n\n请调用 icarus_submit_step，通过 result 参数提交上述结构。工具接受后结束本回合。'
+    }
+    try {
+      await ctx.sessionController.prompt({ requestId: step.requestId, sessionId: run.sessionId, mode: 'queue', content: [{ type: 'text', text: prompt }], clientTimeZone: snapshotOf(run.missionId, run.missionRevision).timezone },
+        AbortSignal.any([unloading.signal, AbortSignal.timeout(Math.min(acceptTimeoutMs, Math.max(1, deadline - now())))]))
+      tracker.armTimeout(Math.max(1, deadline - now()))
+      const end = await tracker.done
+      store.committable(run.id, options.instanceId)
+      const mission = missions.get(run.missionId)
+      if (mission.status !== 'active') throw new Error(`icarus: Mission is ${mission.status}`)
+      const blocked = budgetFailures.get(run.id)
+      if (blocked !== undefined) throw blocked
+      if (tracker.bookkeepingFailure !== null) throw new Error(tracker.bookkeepingFailure.message)
+      if (end.kind !== 'completed') {
+        modelBudget.stop(run.id)
+        throw new Error(`icarus: preparation ${key} ended: ${JSON.stringify(end)}`)
+      }
+      const submitted = db.prepare('SELECT responseRef FROM RunStep WHERE runId = ? AND stepKey = ?').get<{ responseRef: string | null }>(run.id, key)
+      if (validate !== undefined && submitted?.responseRef == null) throw new Error(`icarus: step ${key} ended without submitting its structured result`)
+      const text = validate === undefined ? tracker.resultText() : readArtifact(paths, submitted!.responseRef!)
+      const ref = writeArtifact(paths, `runs/${run.id}/steps/${contentHash(key)}-response.txt`, text)
+      db.prepare('UPDATE RunStep SET responseRef = ?, completedAt = ? WHERE runId = ? AND stepKey = ?').run(ref, now(), run.id, key)
+      return text
+    } finally { submissions.delete(run.sessionId); turns.delete(run.sessionId) }
+  }
+
+  async function executeCurated(run: Run): Promise<ExecutionOutcome> {
+    preparations.add(run.id)
+    try {
+      const revision = snapshotOf(run.missionId, run.missionRevision)
+      const created = await ctx.sessionController.create({ ...(run.sessionId === null ? {} : { sessionId: run.sessionId }), cwd: revision.workspaceRef ?? paths.workspaceDir })
+      if (!store.attachSession(run.id, options.instanceId, created.sessionId)) throw new SupersededError(run.id, 'Session attachment lost its lease')
+      const current = store.get(run.id)
+      const deadline = now() + timeoutMs
+      const signal = AbortSignal.any([unloading.signal, AbortSignal.timeout(timeoutMs)])
+      const result = await options.curation.prepare(current, revision, (key, prompt, validate) => invokeStep(current, key, prompt, deadline, validate), signal)
+      store.committable(run.id, options.instanceId)
+      if ('suppressed' in result) {
+        options.windows.suppress(current.deliveryWindowId!, current.id, options.instanceId, result.outcome)
+        options.faults.clearPreparation(run.missionId, run.missionRevision)
+        return { runId: current.id, status: 'succeeded', detail: 'window suppressed: no qualified content' }
+      }
+      const bodyRef = writeArtifact(paths, `runs/${run.id}/deliverable.md`, result.content)
+      const refusals = approvalsOf(run.id).filter(item => item.outcome !== null && item.outcome !== 'allowed-once')
+      const body = result.content.length <= deliveryMaxChars ? result.content
+        : `${result.content.slice(0, deliveryMaxChars)}\n\n[阅读完整成果](${absoluteArtifactPath(paths, bodyRef)})`
+      const commit = store.commit(run.id, options.instanceId, {
+        deliverable: { id: newId('deliverable'), content: `${body}${refusalLine(refusals)}`, contentHash: contentHash(result.content),
+          requirementResults: result.check, evidenceRefs: result.evidenceRefs, artifactRefs: [...result.artifactRefs, bodyRef] },
+        outboxId: newId('outbox'), channel: OUTBOX_CHANNEL_BOT, usage: modelCallUsage(options.database, run.id), windowOutcomeRef: result.outcomeRef,
+      })
+      options.faults.clearPreparation(run.missionId, run.missionRevision)
+      return { runId: run.id, status: 'succeeded', detail: `prepared; outbox pending ${commit.outboxId}` }
+    } finally { preparations.delete(run.id) }
   }
 
   async function execute(runId: string): Promise<ExecutionOutcome> {
+    if (disposed) return { runId, status: 'skipped', detail: 'execution service is unloaded' }
     const claimed = store.claim(runId, options.instanceId, options.leaseMs ?? DEFAULT_LEASE_MS)
     if (claimed === null) {
       const current = store.get(runId)
@@ -505,11 +668,12 @@ export function createExecutor(options: ExecutorOptions): Executor {
       if (gate.exhausted) {
         return exhaust(claimed, gate, `no remaining budget (${gate.budgetUsed} of ${gate.budget} settled)`)
       }
-      const created = await ctx.sessionController.create({ cwd: paths.workspaceDir })
+      if (claimed.deliveryWindowId !== null) return await executeCurated(claimed)
+      const revision = snapshotOf(claimed.missionId, claimed.missionRevision)
+      const created = await ctx.sessionController.create({ cwd: revision.workspaceRef ?? paths.workspaceDir })
       store.attachSession(runId, options.instanceId, created.sessionId)
       turn = new TurnTracker(created.sessionId, runId)
       turns.set(created.sessionId, turn)
-      const revision = snapshotOf(claimed.missionId, claimed.missionRevision)
       // The second argument is required by the host gateway, which calls `signal.throwIfAborted()`
       // on it with no optional chain — omitting it fails the Run before the prompt is admitted.
       // The signal bounds admission only; the turn itself is bounded by `turn.armTimeout`.
@@ -553,6 +717,20 @@ export function createExecutor(options: ExecutorOptions): Executor {
       if (disposed) return { runId, status: 'abandoned', detail: 'the plugin unloaded during the Run' }
       if (error instanceof SupersededError) return { runId, status: 'superseded', detail: error.reason }
       if (store.get(runId).status === 'succeeded') throw error
+      const currentMission = missions.get(claimed.missionId)
+      if (currentMission.status === 'paused' || currentMission.status === 'cancelled') {
+        store.finish(runId, options.instanceId, { status: 'cancelled', usage: modelCallUsage(options.database, runId) })
+        return { runId, status: 'cancelled', detail: `Mission is ${currentMission.status}` }
+      }
+      if (error instanceof BudgetExhaustedError || budgetFailures.has(runId)) {
+        const ref = writeArtifact(paths, `runs/${runId}/budget.txt`, errorText(error))
+        store.finish(runId, options.instanceId, { status: 'budget_exhausted', usage: modelCallUsage(options.database, runId), errorRef: ref })
+        if (claimed.deliveryWindowId !== null) options.windows.failed(claimed.deliveryWindowId, { kind: 'budget_exhausted', errorRef: ref, at: now() })
+        return { runId, status: 'budget_exhausted', detail: errorText(error) }
+      }
+      if (claimed.deliveryWindowId !== null && error instanceof PreparationBlockedError) {
+        return fail(claimed, turn ?? null, error.kind, error.message, error.detail)
+      }
       return fail(claimed, turn ?? null, 'execution-error', errorText(error), {
         sessionId: turn?.sessionId ?? null,
         error: { name: errorName(error), message: errorText(error), stack: stackSummary(error) },
@@ -571,6 +749,19 @@ export function createExecutor(options: ExecutorOptions): Executor {
       const observation = await ctx.sessionQuery.observeSession(run.sessionId, { projectionMode: 'none' })
       try {
         const events = observation.events
+        if (run.deliveryWindowId !== null) {
+          const pending = options.database.db.prepare('SELECT requestId FROM RunStep WHERE runId = ? AND responseRef IS NULL').all<{ requestId: string }>(run.id)
+          const interrupted = pending.some(step => { const replay = replayStep(events, step.requestId); return replay.started && replay.text === undefined })
+          if (!interrupted) {
+            const claimed = store.reclaim(run.id, options.instanceId, options.leaseMs ?? DEFAULT_LEASE_MS)
+            if (claimed !== null) {
+              try { await executeCurated(claimed) } catch (error) {
+                if (!(error instanceof SupersededError)) fail(claimed, null, 'recovery-error', errorText(error), { phase: claimed.phase })
+              }
+            }
+          } else if (ctx.sessions.get(run.sessionId) !== undefined) ctx.sessionController.cancel({ sessionId: run.sessionId })
+          continue
+        }
         const turn = new TurnTracker(run.sessionId, run.id)
         let end: TurnEnd | undefined
         for (const event of events) {
@@ -618,7 +809,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
         if (mission.status !== 'active' || mission.revision !== run.missionRevision) modelBudget.stop(run.id)
       }
     },
-    active: () => [...turns.values()].map(turn => turn.runId),
+    active: () => [...new Set([...preparations, ...[...turns.values()].map(turn => turn.runId)])],
     dispose: async () => {
       disposed = true
       unloading.abort()

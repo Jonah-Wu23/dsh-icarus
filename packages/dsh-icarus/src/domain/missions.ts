@@ -20,6 +20,8 @@ import { assertKindSchedule, assertTransition, isMissionKind, isMissionStatus, t
 import { assertTimeZone, nextDueAt, parseSchedule } from './schedule.js'
 import type { Mission, MissionKind, MissionRevision, MissionStatus } from './mission.js'
 import type { Schedule } from './schedule.js'
+import { parseBindings } from './bindings.js'
+import type { MissionBindings } from './bindings.js'
 import type { IcarusDatabase } from '../storage/index.js'
 
 export interface MissionService {
@@ -39,7 +41,7 @@ export interface MissionService {
   history(id: string): MissionRevision[]
 }
 
-export interface CreateMissionInput {
+export interface CreateMissionInput extends MissionBindings {
   readonly ownerBotId: string
   readonly kind: MissionKind
   readonly objective: string
@@ -53,7 +55,7 @@ export interface CreateMissionInput {
   readonly id?: string | undefined
 }
 
-export interface MissionPatch {
+export interface MissionPatch extends MissionBindings {
   readonly kind?: MissionKind | undefined
   readonly objective?: string | undefined
   readonly requirements?: readonly string[] | undefined
@@ -83,6 +85,7 @@ export const RESCHEDULE_DELAY_MS = 5_000
 const IN_FLIGHT_RUN_STATUSES = ['queued', 'running', 'awaiting_approval'] as const
 
 interface MissionRow {
+  readonly bindings: string
   readonly id: string
   readonly ownerBotId: string
   readonly kind: string
@@ -101,6 +104,7 @@ interface MissionRow {
 }
 
 interface RevisionRow {
+  readonly bindings: string
   readonly missionId: string
   readonly revision: number
   readonly kind: string
@@ -114,13 +118,13 @@ interface RevisionRow {
 }
 
 const MISSION_COLUMNS = `id, ownerBotId, kind, objective, requirements, revision, status, schedule, timezone,
-  budget, authorizationRef, budgetUsed, nextDueAt, createdAt, updatedAt`
+  budget, authorizationRef, budgetUsed, nextDueAt, createdAt, updatedAt, bindings`
 
 const INSERT_MISSION = `INSERT INTO Mission (${MISSION_COLUMNS})
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
-const INSERT_REVISION = `INSERT INTO MissionRevision (missionId, revision, kind, objective, requirements, schedule, timezone, budget, authorizationRef, createdAt)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+const INSERT_REVISION = `INSERT INTO MissionRevision (missionId, revision, kind, objective, requirements, schedule, timezone, budget, authorizationRef, createdAt, bindings)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 export function inTransaction<T>(database: IcarusDatabase, run: () => T): T {
   database.db.exec('BEGIN IMMEDIATE')
@@ -161,7 +165,7 @@ export function createMissionService(database: IcarusDatabase, options: MissionS
     const rows = database.db
       .prepare(`SELECT DISTINCT Run.missionId AS missionId FROM Deliverable JOIN Run ON Run.id = Deliverable.runId
         JOIN Mission ON Mission.id = Run.missionId AND Mission.revision = Run.missionRevision
-        WHERE Run.missionId IN (${missionSlots})`)
+        WHERE Run.missionId IN (${missionSlots}) AND EXISTS(SELECT 1 FROM Outbox WHERE Outbox.deliverableId = Deliverable.id AND Outbox.purpose = 'deliverable')`)
       .all<{ missionId: string }>(...ids)
     return new Set(rows.map(row => row.missionId))
   }
@@ -218,12 +222,13 @@ export function createMissionService(database: IcarusDatabase, options: MissionS
     const dueAt = nextDueAt(schedule, timezone, at)
     const requirementsJson = JSON.stringify(requirements)
     const scheduleJson = JSON.stringify(schedule)
+    const bindings = JSON.stringify(parseBindings({ ...bindingFields(input) }))
     inTransaction(database, () => {
       database.db.prepare(INSERT_MISSION).run(
         id, ownerBotId, kind, objective, requirementsJson, 1, 'active', scheduleJson, timezone,
-        budget, authorizationRef, 0, dueAt, at, at,
+        budget, authorizationRef, 0, dueAt, at, at, bindings,
       )
-      database.db.prepare(INSERT_REVISION).run(id, 1, kind, objective, requirementsJson, scheduleJson, timezone, budget, authorizationRef, at)
+      database.db.prepare(INSERT_REVISION).run(id, 1, kind, objective, requirementsJson, scheduleJson, timezone, budget, authorizationRef, at, bindings)
     })
     return get(id)
   }
@@ -256,13 +261,14 @@ export function createMissionService(database: IcarusDatabase, options: MissionS
     const storedSchedule: Schedule = rearm ? { kind: 'once', at: rearmedAt } : schedule
     const requirementsJson = JSON.stringify(requirements)
     const scheduleJson = JSON.stringify(storedSchedule)
+    const bindings = JSON.stringify(parseBindings({ ...bindingFields(current), ...bindingFields(patch) }))
     inTransaction(database, () => {
       database.db.prepare(`UPDATE Mission SET kind = ?, objective = ?, requirements = ?, schedule = ?, timezone = ?,
-        budget = ?, authorizationRef = ?, revision = revision + 1, nextDueAt = ?, updatedAt = ? WHERE id = ?`)
-        .run(kind, objective, requirementsJson, scheduleJson, timezone, budget, authorizationRef, dueAt, at, id)
+        budget = ?, authorizationRef = ?, revision = revision + 1, nextDueAt = ?, updatedAt = ?, bindings = ? WHERE id = ?`)
+        .run(kind, objective, requirementsJson, scheduleJson, timezone, budget, authorizationRef, dueAt, at, bindings, id)
       const revision = database.db.prepare('SELECT revision FROM Mission WHERE id = ?').get<{ revision: number }>(id)
       if (revision === undefined) throw new MissionNotFoundError(id)
-      database.db.prepare(INSERT_REVISION).run(id, revision.revision, kind, objective, requirementsJson, scheduleJson, timezone, budget, authorizationRef, at)
+      database.db.prepare(INSERT_REVISION).run(id, revision.revision, kind, objective, requirementsJson, scheduleJson, timezone, budget, authorizationRef, at, bindings)
     })
     return changed(get(id))
   }
@@ -285,10 +291,11 @@ export function createMissionService(database: IcarusDatabase, options: MissionS
   function history(id: string): MissionRevision[] {
     get(id)
     return database.db
-      .prepare(`SELECT missionId, revision, kind, objective, requirements, schedule, timezone, budget, authorizationRef, createdAt
+      .prepare(`SELECT missionId, revision, kind, objective, requirements, schedule, timezone, budget, authorizationRef, createdAt, bindings
         FROM MissionRevision WHERE missionId = ? ORDER BY revision`)
       .all<RevisionRow>(id)
       .map(row => ({
+        ...parseBindings(JSON.parse(row.bindings) as MissionBindings),
         missionId: row.missionId,
         revision: row.revision,
         kind: requireKind(row.kind),
@@ -327,6 +334,7 @@ function toMission(row: MissionRow, awaitingReschedule: boolean): Mission {
   if (!isMissionKind(row.kind)) throw new MissionStateError(`Mission ${JSON.stringify(row.id)} has unknown kind ${JSON.stringify(row.kind)}`)
   if (!isMissionStatus(row.status)) throw new MissionStateError(`Mission ${JSON.stringify(row.id)} has unknown status ${JSON.stringify(row.status)}`)
   return {
+    ...parseBindings(JSON.parse(row.bindings) as MissionBindings),
     id: row.id,
     ownerBotId: row.ownerBotId,
     kind: row.kind,
@@ -343,6 +351,15 @@ function toMission(row: MissionRow, awaitingReschedule: boolean): Mission {
     awaitingReschedule,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
+  }
+}
+
+function bindingFields(value: MissionBindings): MissionBindings {
+  return {
+    ...(value.workspaceRef === undefined ? {} : { workspaceRef: value.workspaceRef }),
+    ...(value.contextRefs === undefined ? {} : { contextRefs: value.contextRefs }),
+    ...(value.capabilityRequirements === undefined ? {} : { capabilityRequirements: value.capabilityRequirements }),
+    ...(value.deliveryPolicy === undefined ? {} : { deliveryPolicy: value.deliveryPolicy }),
   }
 }
 

@@ -69,9 +69,53 @@ export interface Logger {
   debug(message: string, ...args: unknown[]): void
 }
 
+export interface HostAgent {
+  readonly id: string
+  readonly session: { readonly id: string; readonly header: { readonly cwd?: string } }
+  cancel(cause: { readonly kind: 'user' }, options: { readonly keepInbox: true }): void
+}
+
+export interface ToolResult {
+  readonly content: readonly { readonly type: string; readonly text?: string; readonly [key: string]: unknown }[]
+  readonly value?: unknown
+  readonly isError?: boolean
+  readonly error?: { readonly message: string; readonly info?: unknown }
+}
+
+export interface ToolSchema {
+  readonly name: string
+  readonly description: string
+  readonly parameters: Readonly<Record<string, unknown>>
+}
+
+export interface PostToolDecision {
+  readonly kind: 'accept' | 'block'
+  readonly content?: ToolResult['content']
+  readonly value?: unknown
+  readonly [key: string]: unknown
+}
+
+export interface HostToolDefinition extends ToolSchema {
+  readonly output: {
+    readonly schema: Readonly<Record<string, unknown>>
+    render(args: Readonly<Record<string, unknown>>, value: unknown): readonly { readonly type: 'text'; readonly text: string }[]
+  }
+  execute(args: Readonly<Record<string, unknown>>, exec: { readonly agent?: HostAgent; readonly signal: AbortSignal; readonly callId: string }): Promise<unknown>
+}
+
 export interface IcarusContext {
   readonly agents: {
-    get(id: string): { cancel(cause: { readonly kind: 'user' }, options: { readonly keepInbox: true }): void } | undefined
+    get(id: string): HostAgent | undefined
+  }
+  readonly credentials: {
+    resolve(ref: string): Promise<{ readonly value: string; readonly source: string } | undefined>
+    describe(ref: string): Promise<{ readonly configured: boolean }>
+  }
+  readonly tools: {
+    schemas(scope?: HostAgent): readonly ToolSchema[]
+    get(name: string, scope?: HostAgent): unknown
+    register(definition: HostToolDefinition): () => void
+    execute(exec: { readonly callId: string; readonly name: string; readonly arguments: Readonly<Record<string, unknown>>; readonly signal: AbortSignal; readonly agent: HostAgent }): Promise<ToolResult>
   }
   readonly logger: Logger
   readonly sessionController: SessionController
@@ -81,6 +125,7 @@ export interface IcarusContext {
   on(event: 'llm/stream', listener: (request: ModelRequest, next: () => AsyncIterable<ModelChunk>) => AsyncIterable<ModelChunk>): void
   on(event: 'agent/request', listener: (request: { readonly agent: { readonly session: { readonly id: string } } }, next: () => Promise<Record<string, unknown>>) => Promise<Record<string, unknown>>): void
   on(event: 'tools/execute', listener: (request: { readonly agent?: { readonly session: { readonly id: string } } }, next: () => Promise<unknown>) => Promise<unknown>): void
+  on(event: 'tools/post-execute', listener: (request: { readonly agent?: HostAgent; readonly name: string; readonly callId: string }, result: ToolResult, next: () => Promise<PostToolDecision>) => Promise<PostToolDecision>): void
   readonly llm: {
     stream(request: ModelRequest): AsyncIterable<ModelChunk>
     resolveModelInfo(provider: string, model: string): Promise<{ readonly contextWindow?: number }>
@@ -88,6 +133,7 @@ export interface IcarusContext {
   readonly sessions: { get(id: string): { readonly header: { readonly parentSession?: string }; snapshotEvents(): readonly SessionEventLike[] } | undefined }
   readonly sessionQuery: {
     observeSession(id: string, options: { readonly projectionMode: 'none' }): Promise<{
+      readonly header: { readonly cwd?: string }
       readonly events: readonly SessionEventLike[]
       [Symbol.dispose](): void
     }>

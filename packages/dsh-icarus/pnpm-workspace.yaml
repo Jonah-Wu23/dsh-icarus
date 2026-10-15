@@ -3,4 +3,11 @@
 packages:
   - .
 
+allowBuilds:
+  '@jackwener/opencli': false
+
 autoInstallPeers: false
+
+overrides:
+  playwright: 1.64.0
+  patchright: 1.63.0

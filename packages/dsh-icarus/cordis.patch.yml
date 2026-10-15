@@ -8,3 +8,8 @@
         bot: Chief
         demo:
           onBoot: false
+    - id: icarus-browser
+      name: dsh-icarus/browser
+      config:
+        enabled: false
+        headless: true

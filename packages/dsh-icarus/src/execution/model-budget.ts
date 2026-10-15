@@ -16,6 +16,7 @@ export class BudgetExhaustedError extends Error {
 }
 
 interface Owner {
+  readonly notification?: boolean
   readonly id: string
   readonly missionId: string
   readonly missionRevision: number
@@ -64,10 +65,10 @@ export function installModelBudget(options: ModelBudgetOptions): { stop(runId: s
     }
     function deliveryOf(prompt: unknown): Owner | undefined {
       if (typeof prompt !== 'string') return undefined
-      const run = db.prepare(`SELECT Run.id, Run.missionId, Run.missionRevision, Run.status
+      const run = db.prepare(`SELECT Run.id, Run.missionId, Run.missionRevision, Run.status, Outbox.purpose
         FROM Outbox JOIN Deliverable ON Deliverable.id = Outbox.deliverableId JOIN Run ON Run.id = Deliverable.runId
-        WHERE Outbox.id = ?`).get<Omit<Owner, 'delivery'>>(prompt)
-      return run === undefined ? undefined : { ...run, delivery: true }
+        WHERE Outbox.id = ?`).get<Omit<Owner, 'delivery'> & { readonly purpose: string }>(prompt)
+      return run === undefined ? undefined : { ...run, delivery: true, notification: run.purpose === 'fault' }
     }
     let sessionId = request.sessionId
     const visited = new Set<string>()
@@ -118,7 +119,7 @@ export function installModelBudget(options: ModelBudgetOptions): { stop(runId: s
         .get<{ revision: number; status: string; budget: number | null; budgetUsed: number }>(owner.missionId)
       const run = db.prepare('SELECT status, leaseUntil FROM Run WHERE id = ?').get<{ status: string; leaseUntil: number | null }>(owner.id)
       if (mission === undefined || mission.revision !== owner.missionRevision || mission.status === 'cancelled'
-        || run === undefined || (owner.delivery && run.status !== 'succeeded')
+        || run === undefined || (owner.delivery && run.status !== 'succeeded' && !owner.notification)
         || (!owner.delivery && (mission.status !== 'active' || (run.status !== 'running' && run.status !== 'awaiting_approval')
           || run.leaseUntil === null || run.leaseUntil <= Date.now()))) {
         throw new Error('icarus: model request belongs to an inactive or superseded execution')
@@ -148,6 +149,7 @@ export function installModelBudget(options: ModelBudgetOptions): { stop(runId: s
     controllers.set(owner.id, controller)
     const auxiliary = request.purpose !== undefined && request.purpose !== 'execution' && request.purpose !== 'delivery'
     let usage: ModelChunk['usage']
+    let terminalFailure = false
     let dispatched = false
     let resolve!: () => void
     const finished = new Promise<void>(done => { resolve = done })
@@ -174,6 +176,10 @@ export function installModelBudget(options: ModelBudgetOptions): { stop(runId: s
         stream = ctx.llm.stream(bounded)
       }
       for await (const chunk of stream) {
+        if (chunk.type === 'finish') {
+          const reason = chunk.reason
+          terminalFailure = typeof reason === 'object' && reason !== null && 'kind' in reason && (reason.kind === 'error' || reason.kind === 'aborted')
+        }
         if (chunk.type === 'usage') {
           if (chunk.usage === undefined || !Number.isSafeInteger(chunk.usage.inputTokens) || !Number.isSafeInteger(chunk.usage.outputTokens)
             || chunk.usage.inputTokens < 0 || chunk.usage.outputTokens < 0) throw new TypeError('icarus: model returned invalid usage counters')
@@ -181,7 +187,7 @@ export function installModelBudget(options: ModelBudgetOptions): { stop(runId: s
         }
         yield chunk
       }
-      if (usage === undefined) throw new Error('icarus: model call ended without actual usage; reservation retained')
+      if (usage === undefined && !terminalFailure) throw new Error('icarus: model call ended without actual usage; reservation retained')
     } catch (error) {
       if (error instanceof BudgetExhaustedError) options.onBlocked(owner.id, error, request.purpose)
       throw error

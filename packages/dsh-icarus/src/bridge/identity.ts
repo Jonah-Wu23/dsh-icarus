@@ -26,6 +26,13 @@ interface StoredBot {
   readonly segments?: unknown
 }
 
+export async function identityForSession(sessionId: string, options: IdentityOptions = {}): Promise<BotIdentity> {
+  const state = JSON.parse(await readFile(statePathOf(options), 'utf8')) as StoredState
+  const bot = Object.values(state.bots ?? {}).find(bot => bot.id === sessionId || bot.sessionId === sessionId)
+  if (bot === undefined || typeof bot.id !== 'string') throw new Error('icarus: this Session is not a current Bot conversation')
+  return { botId: bot.id, sessionId: typeof bot.sessionId === 'string' ? bot.sessionId : bot.id, name: typeof bot.name === 'string' ? bot.name : bot.id }
+}
+
 interface StoredState {
   readonly bots?: Record<string, StoredBot>
 }

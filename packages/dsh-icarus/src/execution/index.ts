@@ -10,6 +10,18 @@ import { DELIVERY_TIMEOUT_MS, RETRY_DELAY_MS, createOutboxService } from './outb
 import { createRunStore } from './runs.js'
 import { DEFAULT_MAX_OUTPUT_TOKENS } from './model-budget.js'
 import { DEFAULT_MAX_RUNS_PER_TICK, DEFAULT_TICK_MS, createScheduler } from './scheduler.js'
+import { createSourceService } from '../sources/index.js'
+import { createCapabilityService } from '../capabilities/index.js'
+import { createContextService } from '../context/index.js'
+import { createWindowService } from './windows.js'
+import { createCurationService } from './curation.js'
+import type { SourceService } from '../sources/index.js'
+import type { CapabilityService } from '../capabilities/index.js'
+import type { ContextService } from '../context/index.js'
+import type { WindowService } from './windows.js'
+import type { CurationService } from './curation.js'
+import { createFaultService } from './faults.js'
+import type { FaultService } from './faults.js'
 import type { MissionService } from '../domain/index.js'
 import type { IcarusDatabase } from '../storage/index.js'
 import type { IcarusContext } from '../types/host.js'
@@ -28,7 +40,7 @@ export { DEFAULT_MAX_RUNS_PER_TICK, DEFAULT_TICK_MS, createScheduler } from './s
 export type { Scheduler, SchedulerOptions, TickReport } from './scheduler.js'
 export { createExecutor } from './executor.js'
 export type { ExecutionOutcome, ExecutionStatus, Executor, ExecutorOptions } from './executor.js'
-export { MIN_RESULT_CHARS, checkDeliverable } from './requirements.js'
+export { checkDeliverable } from './requirements.js'
 export type { CheckReport, RequirementResult } from './requirements.js'
 
 /** What the host reads at `ctx.icarus.runs`. */
@@ -62,6 +74,12 @@ export interface ExecutionOptions {
 }
 
 export interface IcarusExecution {
+  readonly faults: FaultService
+  readonly sources: SourceService
+  readonly capabilities: CapabilityService
+  readonly context: ContextService
+  readonly windows: WindowService
+  readonly curation: CurationService
   readonly instanceId: string
   readonly runs: RunService
   /** Internals, for M2.4/M2.5 and for driving a lifecycle in tests. */
@@ -85,6 +103,20 @@ export function createExecution(options: ExecutionOptions): IcarusExecution {
   const tickMs = options.tickMs ?? DEFAULT_TICK_MS
 
   const store = createRunStore(options.database, { missions: options.missions, now, newId })
+  const faults = createFaultService(options.database, options.missions)
+  const sources = createSourceService(options.database, async ref => {
+    const hit = await options.ctx.credentials.resolve(ref)
+    if (hit === undefined || hit.value === '') throw new Error(`icarus: credential reference ${ref} is not configured`)
+    return hit.value
+  }, (source, result) => {
+    if (result.status === 'succeeded') faults.clearSource(source.id)
+    else if (result.errorRef !== undefined) faults.record({ missionId: source.missionId, kind: 'source', conditionKey: `source:${source.id}:${source.health.httpStatus ?? 'transport'}`,
+      sourceId: source.id, errorRef: result.errorRef, detail: { message: `${source.adapter} 来源读取失败${source.health.httpStatus === undefined ? '' : `，HTTP ${source.health.httpStatus}`}。`, sourceId: source.id, nextAttemptAt: source.nextPollAt } })
+  })
+  const capabilities = createCapabilityService(options.ctx, options.database, options.missions)
+  const context = createContextService(options.ctx, options.database, capabilities, options.dshHome)
+  const windows = createWindowService(options.database, options.missions, store, now)
+  const curation = createCurationService({ ctx: options.ctx, database: options.database, store, windows, sources, context, capabilities, instanceId })
   const outbox = createOutboxService({
     database: options.database,
     ctx: options.ctx,
@@ -94,6 +126,8 @@ export function createExecution(options: ExecutionOptions): IcarusExecution {
     retryDelayMs: RETRY_DELAY_MS,
     timeoutMs: options.deliveryTimeoutMs ?? DELIVERY_TIMEOUT_MS,
     onSent: deliverableId => {
+      if (options.database.db.prepare('SELECT purpose FROM Outbox WHERE deliverableId = ?').get<{ purpose: string }>(deliverableId)?.purpose === 'fault') return
+      windows.delivered(deliverableId)
       const run = options.database.db.prepare('SELECT Run.missionId, Run.missionRevision FROM Deliverable JOIN Run ON Run.id = Deliverable.runId WHERE Deliverable.id = ?')
         .get<{ missionId: string; missionRevision: number }>(deliverableId)
       if (run === undefined) throw new Error('icarus: confirmed delivery has no Run')
@@ -102,6 +136,10 @@ export function createExecution(options: ExecutionOptions): IcarusExecution {
     },
   })
   const executor = createExecutor({
+    curation,
+    windows,
+    capabilities,
+    faults,
     ctx: options.ctx,
     database: options.database,
     paths: options.database.paths,
@@ -117,6 +155,7 @@ export function createExecution(options: ExecutionOptions): IcarusExecution {
     userTokenBudget: options.userTokenBudget ?? null,
   })
   const scheduler = createScheduler({
+    enqueueWindows: () => windows.scan(),
     database: options.database,
     store,
     executor,
@@ -130,6 +169,10 @@ export function createExecution(options: ExecutionOptions): IcarusExecution {
 
   const recovery: RecoveryReport = { superseded: [], requeued: [] }
   let interval: (() => void) | undefined
+  let sourceInterval: (() => void) | undefined
+  let deliveryInterval: (() => void) | undefined
+  let recoveryInterval: (() => void) | undefined
+  let pendingRefresh: Promise<void> | undefined
   let running = false
   let pendingTick: Promise<TickReport> | undefined
 
@@ -140,6 +183,7 @@ export function createExecution(options: ExecutionOptions): IcarusExecution {
   }
 
   return {
+    sources, capabilities, context, windows, curation, faults,
     instanceId,
     runs: { get: runId => store.get(runId), list: filter => store.list(filter), tick },
     store,
@@ -149,13 +193,27 @@ export function createExecution(options: ExecutionOptions): IcarusExecution {
     recovery,
     start() {
       if (!enabled || interval !== undefined) return
+      const poll = () => { void sources.tick().catch(error => options.ctx.logger.error('icarus: source scan failed: %s', errorText(error))) }
+      const send = () => { void outbox.tick().catch(error => options.ctx.logger.error('icarus: delivery scan failed: %s', errorText(error))) }
+      poll()
+      send()
+      sourceInterval = options.ctx.interval(poll, 1000)
+      deliveryInterval = options.ctx.interval(send, 1000)
+      const refresh = () => {
+        if (pendingRefresh !== undefined) return
+        pendingRefresh = faults.refresh(options.ctx, capabilities, windows)
+          .catch(error => options.ctx.logger.error('icarus: capability recovery failed: %s', errorText(error)))
+          .finally(() => { pendingRefresh = undefined })
+      }
+      refresh()
+      recoveryInterval = options.ctx.interval(refresh, 30_000)
       void tick().catch(error => options.ctx.logger.error('icarus: startup recovery failed: %s', errorText(error)))
       let lastScan = now()
       interval = options.ctx.interval(() => {
         // Renewal stays outside the overlap guard: a Run that outlives several ticks must
         // keep its lease, while a still-running pass must not be started twice.
         scheduler.renewLeases()
-        if (running || now() - lastScan < tickMs) return
+        if (running || now() - lastScan < Math.min(tickMs, 1000)) return
         lastScan = now()
         running = true
         void tick()
@@ -165,12 +223,16 @@ export function createExecution(options: ExecutionOptions): IcarusExecution {
           .finally(() => {
             running = false
           })
-      }, Math.min(tickMs, Math.max(1, Math.floor(leaseMs / 3))))
+      }, Math.min(tickMs, 1000, Math.max(1, Math.floor(leaseMs / 3))))
     },
     async dispose() {
       unsubscribe()
       interval?.()
-      await executor.dispose()
+      sourceInterval?.()
+      deliveryInterval?.()
+      recoveryInterval?.()
+      await Promise.all([executor.dispose(), sources.dispose(), outbox.dispose()])
+      await pendingRefresh
       await pendingTick
     },
   }

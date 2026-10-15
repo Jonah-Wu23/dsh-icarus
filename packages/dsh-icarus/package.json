@@ -8,12 +8,17 @@
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./browser": "./lib/browser.js",
+    "./fetch": "./lib/fetch.js",
     "./package.json": "./package.json"
   },
   "files": [
     "lib/",
     "cordis.patch.yml"
   ],
+  "bin": {
+    "icarus-fetch": "./lib/fetch.js"
+  },
   "meta": {
     "title": "Icarus",
     "description": "持续委托、预算管理与后台成果交付"
@@ -35,6 +40,11 @@
     }
   },
   "dependencies": {
-    "markdown-it": "^15.0.2"
+    "@anweat/dsh-browser": "0.2.1",
+    "@mozilla/readability": "0.6.0",
+    "fast-xml-parser": "5.11.2",
+    "linkedom": "0.18.13",
+    "markdown-it": "^15.0.2",
+    "rss-parser": "3.13.0"
   }
 }

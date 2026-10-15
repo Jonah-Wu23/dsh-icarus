@@ -26,19 +26,29 @@ export function errorText(error: unknown): string {
 }
 
 /** Admit one queued prompt on `sessionId`. Rejects with the host's original error. */
-export async function deliver(ctx: IcarusContext, request: DeliveryRequest): Promise<void> {
+export interface DeliveryReceipt {
+  readonly requestId: string
+  readonly sessionId: string
+  readonly acceptedAt: number
+  readonly meaning: 'host_prompt_accepted'
+}
+
+export async function deliver(ctx: IcarusContext, request: DeliveryRequest): Promise<DeliveryReceipt> {
   const timeout = AbortSignal.timeout(request.timeoutMs ?? DELIVERY_TIMEOUT_MS)
   const signal = request.signal === undefined ? timeout : AbortSignal.any([request.signal, timeout])
+  const requestId = request.requestId ?? randomUUID()
   try {
-    await ctx.sessionController.prompt(
+    const result = await ctx.sessionController.prompt(
       {
-        requestId: request.requestId ?? randomUUID(),
+        requestId,
         sessionId: request.sessionId,
         mode: 'queue',
         content: [{ type: 'text', text: request.text }],
       },
       signal,
     )
+    if (result.accepted !== true) throw new Error('icarus: host did not confirm prompt acceptance')
+    return { requestId, sessionId: request.sessionId, acceptedAt: Date.now(), meaning: 'host_prompt_accepted' }
   } catch (error) {
     ctx.logger.error('icarus: prompt delivery to %s failed: %s', request.sessionId, errorText(error))
     throw error

@@ -10,14 +10,15 @@ import { runDigest } from './demo/digest.js'
 import { errorText } from './bridge/deliver.js'
 import { createIcarusDomain } from './domain/index.js'
 import { DEFAULT_MAX_OUTPUT_TOKENS, createExecution } from './execution/index.js'
-import { openDatabase } from './storage/index.js'
+import { openDatabase, exportMissionData, deleteMissionData } from './storage/index.js'
+import { registerBotTools } from './bridge/tools.js'
 import type { MissionService } from './domain/index.js'
 import type { RunService } from './execution/index.js'
 import type { IcarusContext } from './types/host.js'
 
 export const name = 'dsh-icarus'
 /** `sessionController` drives execution Sessions; `timer` supplies `ctx.interval`. */
-export const inject = ['sessionController', 'timer', 'llm', 'sessions', 'sessionQuery', 'agents']
+export const inject = ['sessionController', 'timer', 'llm', 'sessions', 'sessionQuery', 'agents', 'tools', 'credentials']
 
 export interface IcarusConfig {
   /** Bot id or name that receives deliveries; defaults to the Main Bot `Chief`. */
@@ -56,6 +57,12 @@ export interface ExecutionConfig {
 export interface IcarusService {
   readonly missions: MissionService
   readonly runs: RunService
+  readonly sources: import('./sources/index.js').SourceService
+  readonly capabilities: import('./capabilities/index.js').CapabilityService
+  readonly windows: import('./execution/windows.js').WindowService
+  readonly deliveries: import('./execution/outbox.js').OutboxService
+  readonly faults: import('./execution/faults.js').FaultService
+  readonly data: { exportMission(missionId: string): unknown; deleteMission(missionId: string): import('./storage/index.js').DeleteResult }
 }
 
 interface ResolvedExecutionConfig {
@@ -100,8 +107,10 @@ export function apply(ctx: IcarusContext, config: IcarusConfig = {}): void {
     maxOutputTokens: resolved.execution.maxOutputTokens,
     userTokenBudget: resolved.execution.userTokenBudget,
   })
-  const service: IcarusService = { missions: domain.missions, runs: execution.runs }
+  const service: IcarusService = { missions: domain.missions, runs: execution.runs, sources: execution.sources, capabilities: execution.capabilities, windows: execution.windows, deliveries: execution.outbox,
+    faults: execution.faults, data: { exportMission: id => exportMissionData(database, id), deleteMission: id => deleteMissionData(database, id) } }
   ctx.provide('icarus', service)
+  registerBotTools(ctx, service, execution, database, resolved.dshHome)
   ctx.effect(() => async () => {
     await execution.dispose()
     domain.close()

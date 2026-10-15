@@ -23,6 +23,7 @@ export const DEFAULT_TICK_MS = 60_000
 export const DEFAULT_MAX_RUNS_PER_TICK = 1
 
 export interface SchedulerOptions {
+  readonly enqueueWindows?: () => readonly string[]
   readonly database: IcarusDatabase
   readonly store: RunStore
   readonly executor: Executor
@@ -97,6 +98,7 @@ export function createScheduler(options: SchedulerOptions): Scheduler {
     renewLeases()
     await executor.recover?.()
     const recovered = runRecovery()
+    enqueued.push(...options.enqueueWindows?.() ?? [])
 
     for (const missionId of dueMissionIds()) {
       try {

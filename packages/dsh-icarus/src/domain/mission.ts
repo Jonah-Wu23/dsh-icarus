@@ -6,6 +6,7 @@
 // runtime state and never part of a revision snapshot.
 import { IllegalMissionTransitionError } from './errors.js'
 import type { Schedule } from './schedule.js'
+import type { MissionBindings } from './bindings.js'
 
 export const MISSION_KINDS = ['once', 'recurring'] as const
 export type MissionKind = (typeof MISSION_KINDS)[number]
@@ -13,7 +14,7 @@ export type MissionKind = (typeof MISSION_KINDS)[number]
 export const MISSION_STATUSES = ['active', 'paused', 'completed', 'cancelled'] as const
 export type MissionStatus = (typeof MISSION_STATUSES)[number]
 
-export interface Mission {
+export interface Mission extends MissionBindings {
   readonly id: string
   readonly ownerBotId: string
   readonly kind: MissionKind
@@ -40,7 +41,7 @@ export interface Mission {
 }
 
 /** One revision of a Mission's definition, as written to `MissionRevision`. */
-export interface MissionRevision {
+export interface MissionRevision extends MissionBindings {
   readonly missionId: string
   readonly revision: number
   readonly kind: MissionKind

@@ -1,107 +1,84 @@
-// Requirement check for M2: structural rules the program can decide on its own.
-//
-// The rules (M2 plan §M2.3: non-empty, source reference, length floor, plus one response
-// section per requirement) are:
-//   R1 non-empty      — the trimmed result has content;
-//   R2 length floor   — at least MIN_RESULT_CHARS characters;
-//   R3 source marker  — at least one http(s) link, or a line starting with `来源：`/`来源:`;
-//   R4 response       — for every requirement, a Markdown heading (1-6 `#`) whose text
-//                       contains the requirement, followed by a non-empty section that ends
-//                       at the next heading of the same or a higher level.
-// Semantic judgement (is the answer actually about the requirement) stays with the model,
-// from M3 on. A failed rule never rewrites the result: the caller stores the report and the
-// raw result as the failure record.
 import MarkdownIt from 'markdown-it'
-import { existsSync } from 'node:fs'
-import { isAbsolute } from 'node:path'
-import { fileURLToPath } from 'node:url'
-
-export const MIN_RESULT_CHARS = 200
 
 export interface RequirementResult {
   readonly requirement: string
   readonly passed: boolean
   readonly reason: string
+  readonly evidenceRefs: readonly string[]
+}
+
+export interface ReadingFact {
+  readonly scope: string
+  readonly truncated: boolean | null
+  readonly startOffset: number
+  readonly endOffset: number
+  readonly totalLength: number
+  readonly isError?: boolean
+}
+
+export interface SemanticVerification {
+  readonly objective: { readonly passed: boolean; readonly reason: string; readonly evidenceRefs: readonly string[] }
+  readonly results: readonly RequirementResult[]
+  readonly evidenceRefs: readonly string[]
+  readonly readingClaims: readonly { readonly readingRef: string; readonly scope: string }[]
 }
 
 export interface CheckReport {
   readonly passed: boolean
   readonly results: readonly RequirementResult[]
-  /** Rule failures, in report order; empty when the result passes. */
   readonly failures: readonly string[]
+  readonly verification: SemanticVerification
 }
 
-interface Heading {
-  readonly level: number
-  readonly text: string
-  readonly line: number
-}
+const markdown = new MarkdownIt()
 
-const markdown = new MarkdownIt({ linkify: true })
-
-const normalize = (text: string): string => text.replace(/\s+/g, ' ').trim().toLowerCase()
-
-function headingsOf(text: string): Heading[] {
-  const headings: Heading[] = []
+export function modelJson(text: string): unknown {
   const tokens = markdown.parse(text, {})
-  tokens.forEach((token, index) => {
-    if (token.type !== 'heading_open' || token.map === null) return
-    const content = tokens[index + 1]
-    const title = content?.children?.map(child => child.content).join('') ?? content?.content ?? ''
-    headings.push({ level: Number(token.tag.slice(1)), text: title, line: token.map[0] })
-  })
-  return headings
+  const fence = tokens.length === 1 && tokens[0]?.type === 'fence' ? tokens[0].content : text
+  return JSON.parse(fence) as unknown
 }
 
-function hasSource(text: string, lines: readonly string[]): boolean {
-  const tokens = markdown.parse(text, {})
-  const link = tokens.some(token => token.children?.some(child => {
-    const href = child.type === 'link_open' ? child.attrGet('href') : null
-    if (typeof href !== 'string') return false
-    if (href.startsWith('https://') || href.startsWith('http://')) return true
-    if (href.startsWith('file:')) return existsSync(fileURLToPath(href))
-    const path = decodeURIComponent(href)
-    return isAbsolute(path) && existsSync(path)
-  }))
-  const sourceLine = (line: string): boolean => {
-    const value = line.trim()
-    const marker = ['来源：', '来源:', 'source:', 'source：'].find(prefix => value.toLowerCase().startsWith(prefix))
-    return marker !== undefined && value.slice(marker.length).trim() !== ''
-  }
-  return link || lines.some(sourceLine) || tokens.some(token => token.type === 'inline'
-    && sourceLine(token.children?.map(child => child.content).join('') ?? token.content))
+export function requireObject(value: unknown): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new TypeError('icarus: model response must be an object')
+  return value as Record<string, unknown>
 }
 
-export function checkDeliverable(text: string, requirements: readonly string[]): CheckReport {
+export function stringRefs(value: unknown): string[] {
+  if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || item === '')) throw new TypeError('icarus: evidence references must be a string array')
+  return value as string[]
+}
+
+export function checkDeliverable(text: string, requirements: readonly string[], rawVerification: unknown, evidence: ReadonlyMap<string, ReadingFact>): CheckReport {
   const failures: string[] = []
-  const results: RequirementResult[] = []
-  const lines = text.split('\n')
-  const body = text.trim()
-
-  if (body === '') failures.push('R1 non-empty: the result is empty')
-  if (body.length < MIN_RESULT_CHARS) failures.push(`R2 length floor: ${body.length} of ${MIN_RESULT_CHARS} characters`)
-  if (!hasSource(text, lines)) failures.push('R3 source marker: no usable source reference')
-
-  const headings = headingsOf(text)
-  for (const requirement of requirements) {
-    const wanted = normalize(requirement)
-    const start = headings.findIndex(heading => normalize(heading.text) === wanted)
-    if (start === -1) {
-      results.push({ requirement, passed: false, reason: 'R4 response: no heading carries this requirement' })
-      failures.push(`R4 response: missing section for ${JSON.stringify(requirement)}`)
-      continue
-    }
-    const heading = headings[start]
-    if (heading === undefined) continue
-    const next = headings.slice(start + 1).find(candidate => candidate.level <= heading.level)
-    const section = lines.slice(heading.line + 1, next?.line ?? lines.length).join('\n').trim()
-    if (section === '') {
-      results.push({ requirement, passed: false, reason: 'R4 response: the section has no content' })
-      failures.push(`R4 response: empty section for ${JSON.stringify(requirement)}`)
-      continue
-    }
-    results.push({ requirement, passed: true, reason: 'ok' })
+  if (!text.trim()) failures.push('成果正文为空')
+  const raw = requireObject(rawVerification)
+  function decision(value: Record<string, unknown>) {
+    if (typeof value.passed !== 'boolean' || typeof value.reason !== 'string' || !value.reason.trim()) throw new TypeError('icarus: verification requires a boolean decision and reason')
+    const refs = stringRefs(value.evidenceRefs)
+    for (const ref of refs) if (!evidence.has(ref)) throw new Error(`icarus: verification refers to missing evidence ${ref}`)
+    return { passed: value.passed, reason: value.reason, evidenceRefs: refs }
   }
-
-  return { passed: failures.length === 0, results, failures }
+  const objectiveResult = decision(requireObject(raw.objective))
+  if (!objectiveResult.passed) failures.push(`目标核对失败：${objectiveResult.reason}`)
+  if (!Array.isArray(raw.results) || raw.results.length !== requirements.length) throw new TypeError('icarus: verification must address every requirement exactly once')
+  const results = raw.results.map((value, index) => {
+    const item = requireObject(value)
+    if (item.requirement !== requirements[index]) throw new TypeError('icarus: verification requirement identity mismatch')
+    const result: RequirementResult = { requirement: requirements[index]!, ...decision(item) }
+    if (!result.passed) failures.push(`${result.requirement}：${result.reason}`)
+    return result
+  })
+  const refs = stringRefs(raw.evidenceRefs)
+  for (const ref of refs) if (!evidence.has(ref)) throw new Error(`icarus: missing evidence ${ref}`)
+  if (!Array.isArray(raw.readingClaims)) throw new TypeError('icarus: verification must declare reading claims')
+  const readingClaims = raw.readingClaims.map(value => {
+    const item = requireObject(value)
+    if (typeof item.readingRef !== 'string' || typeof item.scope !== 'string') throw new TypeError('icarus: invalid reading claim')
+    const fact = evidence.get(item.readingRef)
+    if (fact === undefined) throw new Error(`icarus: unknown reading ${item.readingRef}`)
+    if (item.scope !== fact.scope) throw new Error(`icarus: reading ${item.readingRef} supports ${fact.scope}, claimed ${item.scope}`)
+    if (item.scope === 'full' && (fact.truncated !== false || fact.startOffset !== 0 || fact.endOffset !== fact.totalLength)) throw new Error(`icarus: reading ${item.readingRef} does not cover the full content`)
+    return { readingRef: item.readingRef, scope: item.scope }
+  })
+  return { passed: failures.length === 0, results, failures, verification: { objective: objectiveResult, results, evidenceRefs: refs, readingClaims } }
 }
