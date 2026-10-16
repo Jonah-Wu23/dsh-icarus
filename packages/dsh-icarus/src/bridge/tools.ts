@@ -50,13 +50,13 @@ export function registerBotTools(ctx: IcarusContext, service: IcarusService, exe
         default: throw new TypeError('icarus: unknown Mission action')
       }
     })
-  register('icarus_sources', '配置和查询委托的真实来源。adapter 为 rss、arxiv、github 或 web；arxiv locator 为 API 查询式，GitHub locator 为仓库 releases/issues API URL。创建须给出 sinceAt 回看时间。查询保留失败、分页游标及原始证据。',
+  register('icarus_sources', '配置和查询委托的真实来源。adapter 为 rss、arxiv、github、web 或 search；search locator 为查询式，config 保存 timeRange、maxResults 和 site；搜索来源默认每六小时轮询，最短一小时，自动绑定必需搜索能力。创建须给出 sinceAt 回看时间。',
     { action: { type: 'string', enum: ['create', 'list', 'get', 'poll', 'observations', 'attempts', 'evidence', 'requestBudget'] }, missionId: text, sourceId: text, observationId: text,
-      adapter: { type: 'string', enum: ['rss', 'arxiv', 'github', 'web'] }, locator: text, sinceAt: { type: 'integer' }, pollIntervalMs: { type: 'integer' }, credentialRef: text, limit: { type: 'integer' }, offset: { type: 'integer' } }, ['action', 'missionId'], async (args, exec) => {
+      adapter: { type: 'string', enum: ['rss', 'arxiv', 'github', 'web', 'search'] }, config: object, locator: text, sinceAt: { type: 'integer' }, pollIntervalMs: { type: 'integer' }, credentialRef: text, limit: { type: 'integer' }, offset: { type: 'integer' } }, ['action', 'missionId'], async (args, exec) => {
       const missionId = requireText(args.missionId)
       await authorize(missionId, exec.agent, ['create', 'poll'].includes(String(args.action)))
       if (args.action === 'create') return service.sources.create({ missionId, adapter: args.adapter as SourceAdapter, locator: requireText(args.locator), sinceAt: args.sinceAt as number,
-        ...(args.pollIntervalMs === undefined ? {} : { pollIntervalMs: args.pollIntervalMs as number }), ...(args.credentialRef === undefined ? {} : { credentialRef: requireText(args.credentialRef) }) })
+        ...(args.pollIntervalMs === undefined ? {} : { pollIntervalMs: args.pollIntervalMs as number }), ...(args.config === undefined ? {} : { config: args.config as Pick<import('../sources/types.js').SourceConfig, 'timeRange' | 'maxResults' | 'site'> }), ...(args.credentialRef === undefined ? {} : { credentialRef: requireText(args.credentialRef) }) })
       if (args.action === 'list') return service.sources.list(missionId)
       if (args.action === 'evidence') {
         const observationId = requireText(args.observationId)

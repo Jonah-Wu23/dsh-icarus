@@ -5,6 +5,7 @@ packages:
 
 allowBuilds:
   '@jackwener/opencli': false
+  esbuild: true
 
 autoInstallPeers: false
 

@@ -284,12 +284,11 @@ M3 完成须同时具备：可连续运行的来源链、当前背景下的明�
 | 修改已准备成果的委托 | 旧 revision 的 prepared 窗口标记 superseded，其 outbox 保持 pending、尝试次数 0；新 revision 独立准备并交付 |
 | 暂停已准备成果的委托 | 投递调用返回 `attempted: false`，恢复后按当前窗口继续 |
 | 结束宿主进程后重启 | 重新读取同一 prepared 窗口并直接投递原成果，deliverable 与 outbox 均未改变，实际延迟 1452 ms，Chief 完成回复 |
+| Bot 会话换代 | 通过 DS Bot 工作目录迁移完成真实换代，稳定 Bot ID 保留；换代后 `recall` 在新 Session 读取背景；换代前后各准备一份成果，均进入新 Session，投递延迟 993 ms 与 1005 ms；旧 Session 无对应投递，每份仅接收一次、尝试一次，Bot 两轮回复均完成 |
 | 停用再恢复 Fetch 连接 | 能力检查为 `missing`，准备被阻止并保存 capability 结果，故障单记录并向 Chief 通知；恢复后检查为 `available`，故障清除，新代次重新准备并以 68 ms 延迟交付 |
 | 投递被中断 | 在投递进入未确认状态时终止进程；重启后该 outbox 仍为 `delivery_unknown`、尝试次数 1、回执为空，扫描没有自动重发，`reconcile` 依据 Session 事件判定仍未确认 |
 | 空结果与来源失败 | 健康来源没有合格内容时窗口保存 `suppressed` 与 `no-qualified-content`；来源访问失败时窗口保存 `sources` 失败结果，来源健康记录 HTTP 403 与原始错误，故障单单独通知 |
 | 要求核对与失败重试 | 模型在核对阶段判定成果声称的全文阅读与实际 Reading 记录不符而拒绝，窗口保存失败原因；显式重试后新代次重新准备并交付 |
 | 数据导出 | 两项真实委托各导出 19 张表的范围记录与 80 余个证据文件，引用完整、不含凭据字段 |
-
-本轮会话相关验证覆盖宿主重启和投递时重新解析当前 Bot Session，未主动触发 DS Bot 强制会话换代。
 
 运行记录保存在 Icarus 数据目录与 `.work/m3-evidence/`。M3 的交付内容即第 2 节定义的能力；M4 沿用已保存的来源、资料与能力引用实现反馈与进一步调查。

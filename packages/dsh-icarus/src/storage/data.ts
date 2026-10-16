@@ -8,6 +8,7 @@
 import { existsSync, rmSync, statSync, readFileSync } from 'node:fs'
 import { resolve, sep } from 'node:path'
 import type { IcarusDatabase } from './database.js'
+import { inTransaction } from '../domain/missions.js'
 
 export interface DeleteResult {
   /** Mission rows removed; the cascade removed every row below them. */
@@ -20,7 +21,10 @@ export interface DeleteResult {
 export function deleteMissionData(database: IcarusDatabase, missionId: string): DeleteResult {
   const refs = collectArtifactRefs(database, [missionId])
   const directories = ownedDirectories(database, [missionId])
-  const removed = database.db.prepare('DELETE FROM Mission WHERE id = ?').run(missionId)
+  const removed = inTransaction(database, () => {
+    detachSearchAccounting(database, [missionId])
+    return database.db.prepare('DELETE FROM Mission WHERE id = ?').run(missionId)
+  })
   const missions = Number(removed.changes)
   const artifacts = missions === 0 ? 0 : removeArtifacts(database.paths.artifactsDir, refs)
   if (missions > 0) for (const path of directories) if (existsSync(path)) rmSync(path, { recursive: true })
@@ -36,7 +40,10 @@ export function deleteBotData(database: IcarusDatabase, ownerBotId: string): Del
   if (missionIds.length === 0) return { missions: 0, artifacts: 0 }
   const refs = collectArtifactRefs(database, missionIds)
   const directories = ownedDirectories(database, missionIds)
-  const removed = database.db.prepare('DELETE FROM Mission WHERE ownerBotId = ?').run(ownerBotId)
+  const removed = inTransaction(database, () => {
+    detachSearchAccounting(database, missionIds)
+    return database.db.prepare('DELETE FROM Mission WHERE ownerBotId = ?').run(ownerBotId)
+  })
   const artifacts = removeArtifacts(database.paths.artifactsDir, refs)
   for (const path of directories) if (existsSync(path)) rmSync(path, { recursive: true })
   return { missions: Number(removed.changes), artifacts }
@@ -47,6 +54,7 @@ function collectArtifactRefs(database: IcarusDatabase, missionIds: readonly stri
   const refs = new Set<string>()
   const ids = missionIds.map(() => '?').join(', ')
   const sources: readonly { readonly sql: string; readonly list: boolean }[] = [
+    { sql: `SELECT responseRef AS value FROM SearchCall WHERE missionId IN (${ids})`, list: false },
     { sql: `SELECT inputRefs AS value FROM Run WHERE missionId IN (${ids})`, list: true },
     { sql: `SELECT errorRef AS value FROM Run WHERE missionId IN (${ids})`, list: false },
     { sql: `SELECT contextRef AS value FROM Run WHERE missionId IN (${ids})`, list: false },
@@ -77,6 +85,13 @@ function collectArtifactRefs(database: IcarusDatabase, missionIds: readonly stri
   return refs
 }
 
+function detachSearchAccounting(database: IcarusDatabase, missionIds: readonly string[]): void {
+  const slots = missionIds.map(() => '?').join(', ')
+  database.db.prepare(`UPDATE SearchProviderState SET lastErrorRef = NULL WHERE lastErrorRef IN (SELECT responseRef FROM SearchCall WHERE missionId IN (${slots}))`).run(...missionIds)
+  // 删除查询与关联信息，保留匿名计量，避免删除委托后重新消耗同一份免费额度。
+  database.db.prepare(`UPDATE SearchCall SET missionId = NULL, runId = NULL, sessionId = NULL, query = NULL, url = NULL, responseRef = NULL WHERE missionId IN (${slots})`).run(...missionIds)
+}
+
 function ownedDirectories(database: IcarusDatabase, missionIds: readonly string[]): readonly string[] {
   const directories: string[] = []
   for (const missionId of missionIds) {
@@ -101,7 +116,7 @@ export function exportMissionData(database: IcarusDatabase, missionId: string): 
   const mission = database.db.prepare('SELECT * FROM Mission WHERE id = ?').get(missionId)
   if (mission === undefined) throw new Error('icarus: Mission does not exist')
   const result: Record<string, unknown> = { Mission: mission }
-  const direct = ['MissionRevision', 'Source', 'Run', 'PreferenceRevision', 'DeliveryWindow', 'ObservationAssessment', 'CapabilityCheck', 'CapabilityRecommendation', 'ToolReading', 'Fault']
+  const direct = ['MissionRevision', 'Source', 'Run', 'PreferenceRevision', 'DeliveryWindow', 'ObservationAssessment', 'CapabilityCheck', 'CapabilityRecommendation', 'ToolReading', 'Fault', 'SearchCall']
   for (const table of direct) result[table] = database.db.prepare(`SELECT * FROM ${table} WHERE missionId = ?`).all(missionId)
   const queries: Record<string, string> = {
     Observation: 'sourceId IN (SELECT id FROM Source WHERE missionId = ?)',

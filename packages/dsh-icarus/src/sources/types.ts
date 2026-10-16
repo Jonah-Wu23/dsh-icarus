@@ -1,10 +1,13 @@
-export type SourceAdapter = 'rss' | 'arxiv' | 'github' | 'web'
+export type SourceAdapter = 'rss' | 'arxiv' | 'github' | 'web' | 'search'
 
 export interface SourceConfig {
   readonly sinceAt: number
   readonly pollIntervalMs: number
   readonly credentialRef?: string
   readonly pageSize?: number
+  readonly timeRange?: import('../search/types.js').TimeRange
+  readonly maxResults?: number
+  readonly site?: string
 }
 
 export interface PageCursor {
@@ -35,7 +38,7 @@ export interface SourceItem {
   readonly publishedAt: number | null
   readonly metadata: Readonly<Record<string, unknown>>
   readonly reading: {
-    readonly scope: 'abstract' | 'full' | 'partial'
+    readonly scope: 'abstract' | 'full' | 'partial' | 'snippet' | 'vendor_extract'
     readonly truncated: boolean
     readonly continuation: string | null
   }

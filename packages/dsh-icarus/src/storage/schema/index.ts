@@ -8,5 +8,6 @@ import { preparationRecords } from './0005-preparation-records.js'
 import { deliveryAttempts } from './0006-delivery-attempts.js'
 import { faultNotifications } from './0007-fault-notifications.js'
 import { sourceRequestBudgets } from './0008-source-request-budgets.js'
+import { webSearch } from './0009-web-search.js'
 
-export const MIGRATIONS: readonly Migration[] = [coreRecords, runApprovals, modelCalls, continuousSources, preparationRecords, deliveryAttempts, faultNotifications, sourceRequestBudgets]
+export const MIGRATIONS: readonly Migration[] = [coreRecords, runApprovals, modelCalls, continuousSources, preparationRecords, deliveryAttempts, faultNotifications, sourceRequestBudgets, webSearch]

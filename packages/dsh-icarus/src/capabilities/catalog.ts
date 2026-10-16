@@ -12,6 +12,9 @@ export interface CapabilityCandidate {
 }
 
 export const CAPABILITY_CATALOG: readonly CapabilityCandidate[] = [
+  { id: 'web-search', kind: 'dsh', package: 'dsh-icarus', source: 'https://github.com/tianmingwan/dsh-balanced-search', purpose: '联网搜索与厂商服务端正文抽取',
+    authentication: '至少一家 API key', freeConditions: 'Keenable 每月 100000 次；Exa 注册赠额与每月额度以后台为准，Icarus 每月按 10 美元控制；Tavily 每月 1000 credits，基础搜索每次 1 credit',
+    connectionEntry: 'DSH 插件 → Icarus → 联网搜索。填写 key 后测试连接；只填一家也能用。', verifiedVersion: '0.2.0-rc.2', status: 'unknown' },
   { id: 'fetch', kind: 'mcp', package: 'mcp-server-fetch', source: 'https://github.com/modelcontextprotocol/servers/tree/main/src/fetch', purpose: '读取公开网页正文',
     authentication: '公开页面无需账号', freeConditions: '本地运行免费；模型调用按现有模型计费', connectionEntry: '设置 → MCP Server Manager → 添加 stdio，使用本目录 connection 中的 command 与 args；Icarus 补齐 Python 依赖并处理代理环境，需要 uvx', verifiedVersion: '2026.10.10', status: 'unknown' },
   { id: 'markitdown', kind: 'mcp', package: 'markitdown-mcp', source: 'https://github.com/microsoft/markitdown/tree/main/packages/markitdown-mcp', purpose: '将论文和文档转换为可读文本',

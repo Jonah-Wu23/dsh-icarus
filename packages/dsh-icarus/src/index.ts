@@ -15,12 +15,27 @@ import { registerBotTools } from './bridge/tools.js'
 import type { MissionService } from './domain/index.js'
 import type { RunService } from './execution/index.js'
 import type { IcarusContext } from './types/host.js'
+import type { IcarusDatabase } from './storage/index.js'
+import Schema from '@deepseek-ai/schemastery'
+import { createSearchService } from './search/service.js'
+import type { SearchService } from './search/service.js'
+import type { SearchOptions } from './search/types.js'
 
 export const name = 'dsh-icarus'
 /** `sessionController` drives execution Sessions; `timer` supplies `ctx.interval`. */
 export const inject = ['sessionController', 'timer', 'llm', 'sessions', 'sessionQuery', 'agents', 'tools', 'credentials']
 
+export const Config = Schema.object({
+  bot: Schema.string().default('Chief'),
+  dshHome: Schema.string(),
+  demo: Schema.object({ onBoot: Schema.boolean().default(false), maxResults: Schema.number() }),
+  execution: Schema.object({ enabled: Schema.boolean(), maxOutputTokens: Schema.number(), userTokenBudget: Schema.any(),
+    intervalMs: Schema.number(), leaseMs: Schema.number(), timeoutMs: Schema.number(), deliveryTimeoutMs: Schema.number(), maxRunsPerTick: Schema.number() }),
+  search: Schema.object({ tavilyDepth: Schema.union(['basic', 'advanced']).default('basic') }).volatile(),
+})
+
 export interface IcarusConfig {
+  readonly search?: SearchOptions | { get(): SearchOptions }
   /** Bot id or name that receives deliveries; defaults to the Main Bot `Chief`. */
   readonly bot?: string | undefined
   /** DSH home holding `bot/state.json` and `icarus/`; defaults to `$DSH_HOME`, then `~/.dsh`. */
@@ -55,6 +70,8 @@ export interface ExecutionConfig {
 
 /** What the plugin publishes to the host as `ctx.icarus`. */
 export interface IcarusService {
+  readonly search: SearchService
+  readonly searchDatabase: IcarusDatabase
   readonly missions: MissionService
   readonly runs: RunService
   readonly sources: import('./sources/index.js').SourceService
@@ -92,7 +109,9 @@ export function apply(ctx: IcarusContext, config: IcarusConfig = {}): void {
   const resolved = resolveConfig(config)
   const database = openDatabase({ dshHome: resolved.dshHome })
   const domain = createIcarusDomain(database)
+  const search = createSearchService(ctx, database, () => config.search !== undefined && 'get' in config.search ? config.search.get() : config.search ?? {})
   const execution = createExecution({
+    search,
     ctx,
     database,
     missions: domain.missions,
@@ -107,12 +126,13 @@ export function apply(ctx: IcarusContext, config: IcarusConfig = {}): void {
     maxOutputTokens: resolved.execution.maxOutputTokens,
     userTokenBudget: resolved.execution.userTokenBudget,
   })
-  const service: IcarusService = { missions: domain.missions, runs: execution.runs, sources: execution.sources, capabilities: execution.capabilities, windows: execution.windows, deliveries: execution.outbox,
+  const service: IcarusService = { search, searchDatabase: database, missions: domain.missions, runs: execution.runs, sources: execution.sources, capabilities: execution.capabilities, windows: execution.windows, deliveries: execution.outbox,
     faults: execution.faults, data: { exportMission: id => exportMissionData(database, id), deleteMission: id => deleteMissionData(database, id) } }
   ctx.provide('icarus', service)
   registerBotTools(ctx, service, execution, database, resolved.dshHome)
   ctx.effect(() => async () => {
     await execution.dispose()
+    await search.dispose()
     domain.close()
   }, 'icarus: execution and storage')
   execution.start()
@@ -152,6 +172,8 @@ function resolveConfig(config: IcarusConfig): ResolvedConfig {
   if (maxResults !== undefined && (!Number.isInteger(maxResults) || maxResults <= 0)) throw new TypeError('icarus: config.demo.maxResults must be a positive integer')
   return { bot: bot.trim(), dshHome: config.dshHome, demo: { onBoot, maxResults }, execution: resolveExecution(config.execution) }
 }
+
+export default { name, inject, apply, Config }
 
 function resolveExecution(config: ExecutionConfig | undefined): ResolvedExecutionConfig {
   const enabled = config?.enabled ?? true

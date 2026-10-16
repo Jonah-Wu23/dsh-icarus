@@ -17,6 +17,7 @@ export interface CapabilityRequirement {
 }
 
 export interface MissionBindings {
+  readonly searchBudget?: SearchBudget
   readonly workspaceRef?: string
   readonly contextRefs?: readonly ContextRef[]
   readonly capabilityRequirements?: readonly CapabilityRequirement[]
@@ -27,8 +28,18 @@ export interface MissionBindings {
   }
 }
 
+export interface SearchBudget {
+  readonly perRun: number
+  readonly perMonth: number
+  readonly allowPaid?: boolean
+}
+
 export function parseBindings(value: MissionBindings): MissionBindings {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('icarus: invalid bindings')
+  if (value.searchBudget !== undefined) {
+    for (const limit of [value.searchBudget.perRun, value.searchBudget.perMonth]) if (!Number.isSafeInteger(limit) || limit < 0) throw new TypeError('icarus: search budgets must be non-negative integers')
+    if (value.searchBudget.allowPaid !== undefined && typeof value.searchBudget.allowPaid !== 'boolean') throw new TypeError('icarus: searchBudget.allowPaid must be boolean')
+  }
   if (value.workspaceRef !== undefined && (typeof value.workspaceRef !== 'string' || value.workspaceRef.trim() === '')) throw new TypeError('icarus: workspaceRef required')
   for (const ref of value.contextRefs ?? []) {
     if (!['file', 'bot', 'tool'].includes(ref.kind) || !ref.id || !ref.locator || !ref.purpose) throw new TypeError('icarus: invalid context reference')

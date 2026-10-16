@@ -108,12 +108,13 @@ declare class URL {
   readonly password: string
   readonly pathname: string
   readonly href: string
-  readonly searchParams: { get(name: string): string | null; set(name: string, value: string): void }
+  hash: string
+  readonly searchParams: { get(name: string): string | null; set(name: string, value: string): void; sort(): void }
 }
 
 declare function fetch(
   url: string,
-  init?: { readonly signal?: AbortSignal | undefined; readonly headers?: Record<string, string> | undefined },
+  init?: { readonly signal?: AbortSignal | undefined; readonly headers?: Record<string, string> | undefined; readonly method?: string; readonly body?: string },
 ): Promise<Response>
 
 // node:sqlite (built into Node 24; the desktop runtime is 24.18.1). Statically linked,

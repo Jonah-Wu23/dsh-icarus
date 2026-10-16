@@ -13,3 +13,5 @@
       config:
         enabled: false
         headless: true
+    - id: icarus-search
+      name: dsh-icarus/search

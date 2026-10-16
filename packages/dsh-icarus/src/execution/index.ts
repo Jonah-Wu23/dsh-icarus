@@ -52,6 +52,7 @@ export interface RunService {
 }
 
 export interface ExecutionOptions {
+  readonly search?: import('../search/service.js').SearchService
   readonly maxOutputTokens?: number
   readonly userTokenBudget?: number | null
   readonly ctx: IcarusContext
@@ -112,8 +113,8 @@ export function createExecution(options: ExecutionOptions): IcarusExecution {
     if (result.status === 'succeeded') faults.clearSource(source.id)
     else if (result.errorRef !== undefined) faults.record({ missionId: source.missionId, kind: 'source', conditionKey: `source:${source.id}:${source.health.httpStatus ?? 'transport'}`,
       sourceId: source.id, errorRef: result.errorRef, detail: { message: `${source.adapter} 来源读取失败${source.health.httpStatus === undefined ? '' : `，HTTP ${source.health.httpStatus}`}。`, sourceId: source.id, nextAttemptAt: source.nextPollAt } })
-  })
-  const capabilities = createCapabilityService(options.ctx, options.database, options.missions)
+  }, options.search, options.missions)
+  const capabilities = createCapabilityService(options.ctx, options.database, options.missions, options.search)
   const context = createContextService(options.ctx, options.database, capabilities, options.dshHome)
   const windows = createWindowService(options.database, options.missions, store, now)
   const curation = createCurationService({ ctx: options.ctx, database: options.database, store, windows, sources, context, capabilities, instanceId })
@@ -136,6 +137,7 @@ export function createExecution(options: ExecutionOptions): IcarusExecution {
     },
   })
   const executor = createExecutor({
+    search: options.search,
     curation,
     windows,
     capabilities,

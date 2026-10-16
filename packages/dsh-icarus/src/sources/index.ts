@@ -7,6 +7,8 @@ import { existsSync } from 'node:fs'
 import { artifactPathOf } from '../execution/artifacts.js'
 import type { IcarusDatabase } from '../storage/index.js'
 import type { Source, SourceAdapter, SourceConfig, Observation, SourcePage, SourceRateLimit } from './types.js'
+import type { SearchService } from '../search/service.js'
+import type { MissionService } from '../domain/index.js'
 
 export type { Source, SourceAdapter, SourceConfig, SourceItem, SourcePage, Observation } from './types.js'
 
@@ -15,7 +17,7 @@ export interface SourcePollResult { readonly sourceId: string; readonly status: 
 interface SourceRow extends Omit<Source, 'config' | 'cursor' | 'health'> { config: string; cursor: string | null; health: string | null }
 
 export interface SourceService {
-  create(input: { readonly missionId: string; readonly adapter: SourceAdapter; readonly locator: string; readonly sinceAt: number; readonly pollIntervalMs?: number; readonly credentialRef?: string; readonly pageSize?: number }): Source
+  create(input: { readonly missionId: string; readonly adapter: SourceAdapter; readonly locator: string; readonly sinceAt: number; readonly pollIntervalMs?: number; readonly credentialRef?: string; readonly pageSize?: number; readonly config?: Pick<SourceConfig, 'timeRange' | 'maxResults' | 'site'> }): Source
   get(id: string): Source
   list(missionId?: string): Source[]
   observations(sourceId: string, limit?: number, offset?: number): Observation[]
@@ -27,7 +29,7 @@ export interface SourceService {
   dispose(): Promise<void>
 }
 
-export function createSourceService(database: IcarusDatabase, credential?: (ref: string) => Promise<string>, onResult?: (source: Source, result: SourcePollResult) => void): SourceService {
+export function createSourceService(database: IcarusDatabase, credential?: (ref: string) => Promise<string>, onResult?: (source: Source, result: SourcePollResult) => void, search?: SearchService, missions?: MissionService): SourceService {
   const { db, paths } = database
   const active = new Map<string, Promise<Awaited<ReturnType<SourceService['poll']>>>>()
   const stopping = new AbortController()
@@ -79,7 +81,7 @@ export function createSourceService(database: IcarusDatabase, credential?: (ref:
     const observedAt = Date.now()
     const rawRef = page.raw === null ? null : writeArtifact(paths, `sources/${source.id}/${attemptId}/response.txt`, page.raw)
     const records = page.items.map(item => {
-      const fingerprint = contentHash(JSON.stringify(item))
+      const fingerprint = contentHash(JSON.stringify(source.adapter === 'search' ? { title: item.title, content: item.content } : item))
       const ref = `sources/${source.id}/items/${contentHash(item.nativeId)}/${fingerprint}.json`
       if (!existsSync(artifactPathOf(paths, ref))) writeArtifact(paths, ref, JSON.stringify({ ...item, sourceId: source.id, contentHash: fingerprint, observedAt, rawRef, requestUrl: page.url }))
       return { item, fingerprint, ref }
@@ -114,7 +116,26 @@ export function createSourceService(database: IcarusDatabase, credential?: (ref:
         if (credential === undefined) throw new Error('icarus: host credential resolver is not connected')
         token = await credential(source.config.credentialRef)
       }
-      const page = await readSourcePage(source, AbortSignal.any([stopping.signal, AbortSignal.timeout(60_000)]), token)
+      const signal = AbortSignal.any([stopping.signal, AbortSignal.timeout(60_000)])
+      let page: SourcePage
+      if (source.adapter === 'search') {
+        if (search === undefined) throw new Error('icarus: search service is not connected')
+        const found = await search.search({ query: source.config.site === undefined ? source.locator : `${source.locator} site:${source.config.site}`,
+          maxResults: source.config.maxResults, timeRange: source.config.timeRange }, { missionId: source.missionId, purpose: 'source-poll' }, signal)
+        page = { items: found.results.filter(item => {
+          if (source.config.site === undefined) return true
+          const host = publicUrl(item.url).hostname
+          return host === source.config.site || host.endsWith(`.${source.config.site}`)
+        }).map(item => {
+          const url = publicUrl(item.url)
+          url.hash = ''
+          url.searchParams.sort()
+          return { nativeId: url.href, url: url.href, title: item.title, content: item.content,
+            publishedAt: item.publishedAt === null || !Number.isFinite(Date.parse(item.publishedAt)) ? null : Date.parse(item.publishedAt),
+            metadata: { provider: item.provider, callId: found.callId, responseRef: found.evidenceRef },
+            reading: { scope: 'snippet' as const, truncated: false, continuation: item.url } }
+        }).filter(item => item.publishedAt === null || item.publishedAt >= source.config.sinceAt), cursor: {}, status: 200, more: false, raw: JSON.stringify(found), url: `icarus-search:${source.locator}` }
+      } else page = await readSourcePage(source, signal, token)
       recordRateLimit(source, page.rateLimit)
       return { sourceId: id, status: 'succeeded', added: savePage(source, attemptId, page) }
     } catch (error) {
@@ -141,16 +162,27 @@ export function createSourceService(database: IcarusDatabase, credential?: (ref:
   }
   return {
     create(input) {
-      if (!['rss', 'arxiv', 'github', 'web'].includes(input.adapter)) throw new TypeError('icarus: unknown source adapter')
+      if (!['rss', 'arxiv', 'github', 'web', 'search'].includes(input.adapter)) throw new TypeError('icarus: unknown source adapter')
       if (typeof input.locator !== 'string' || input.locator.trim() === '') throw new TypeError('icarus: source locator required')
-      if (input.adapter !== 'arxiv') publicUrl(input.locator)
+      if (input.adapter !== 'arxiv' && input.adapter !== 'search') publicUrl(input.locator)
       if (!Number.isSafeInteger(input.sinceAt) || input.sinceAt < 0 || input.sinceAt > Date.now()) throw new TypeError('icarus: explicit source lookback must be a past timestamp')
-      const interval = input.pollIntervalMs ?? 3_600_000
+      const interval = input.pollIntervalMs ?? (input.adapter === 'search' ? 21_600_000 : 3_600_000)
       if (!Number.isSafeInteger(interval) || interval < 3000) throw new TypeError('icarus: poll interval must be at least 3000 ms')
+      if (input.adapter === 'search' && interval < 3_600_000) throw new TypeError('icarus: search polling interval must be at least one hour')
+      if (input.config?.timeRange !== undefined && !['day','week','month','year'].includes(input.config.timeRange)) throw new TypeError('icarus: invalid search timeRange')
+      if (input.config?.maxResults !== undefined && (!Number.isInteger(input.config.maxResults) || input.config.maxResults < 1 || input.config.maxResults > 20)) throw new TypeError('icarus: invalid search maxResults')
+      if (input.config?.site !== undefined && new URL(`https://${input.config.site}`).hostname !== input.config.site) throw new TypeError('icarus: site must be a hostname')
       if (input.pageSize !== undefined && (!Number.isSafeInteger(input.pageSize) || input.pageSize < 1 || input.pageSize > 100)) throw new TypeError('icarus: source pageSize must be between 1 and 100')
       const id = newId('source')
       const now = Date.now()
-      const config: SourceConfig = { sinceAt: input.sinceAt, pollIntervalMs: interval, ...(input.credentialRef === undefined ? {} : { credentialRef: input.credentialRef }), ...(input.pageSize === undefined ? {} : { pageSize: input.pageSize }) }
+      const config: SourceConfig = { ...input.config, sinceAt: input.sinceAt, pollIntervalMs: interval, ...(input.credentialRef === undefined ? {} : { credentialRef: input.credentialRef }), ...(input.pageSize === undefined ? {} : { pageSize: input.pageSize }) }
+      if (input.adapter === 'search' && missions !== undefined) {
+        const mission = missions.get(input.missionId)
+        if (!mission.capabilityRequirements?.some(item => item.tool === 'icarus_web_search' && item.required)) missions.modify(mission.id, {
+          capabilityRequirements: [...mission.capabilityRequirements ?? [], { provider: 'Icarus', tool: 'icarus_web_search', required: true, purpose: '搜索来源检索；DSH 插件 → Icarus → 联网搜索' }],
+          searchBudget: mission.searchBudget ?? { perRun: 10, perMonth: 600 },
+        })
+      }
       db.prepare('INSERT INTO Source(id, missionId, adapter, locator, config, nextPollAt, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)')
         .run(id, input.missionId, input.adapter, input.locator, JSON.stringify(config), now, now)
       return get(id)

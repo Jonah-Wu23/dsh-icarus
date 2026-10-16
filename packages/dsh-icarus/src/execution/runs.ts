@@ -129,6 +129,7 @@ export interface DeliverableView {
 }
 
 export type RunView = Run & {
+  readonly searchUsage: readonly { readonly provider: string; readonly calls: number; readonly units: number; readonly costDollars: number }[]
   readonly deliverables: readonly DeliverableView[]
   /** The owning Mission's budget, assembled for readers; `remaining` may go negative after an overspend. */
   readonly budget: RunBudgetView
@@ -380,7 +381,9 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
   }
 
   function view(row: RunRow): RunView {
-    return { ...toRun(row), deliverables: deliverablesOf(row.id), budget: budgetOf(row.missionId) }
+    const searchUsage = db.prepare('SELECT provider, COUNT(*) AS calls, SUM(units) AS units, COALESCE(SUM(costDollars), 0) AS costDollars FROM SearchCall WHERE runId = ? GROUP BY provider')
+      .all<{ provider: string; calls: number; units: number; costDollars: number }>(row.id)
+    return { ...toRun(row), deliverables: deliverablesOf(row.id), budget: budgetOf(row.missionId), searchUsage }
   }
 
   function enqueueDue(missionId: string): Run | null {

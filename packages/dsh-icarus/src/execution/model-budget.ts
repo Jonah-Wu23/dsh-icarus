@@ -9,7 +9,7 @@ import type { TokenUsage } from './runs.js'
 export const DEFAULT_MAX_OUTPUT_TOKENS = 8192
 
 export class BudgetExhaustedError extends Error {
-  constructor(message: string) {
+  constructor(message: string, readonly reason: 'model' | 'search' = 'model') {
     super(`icarus: ${message}`)
     this.name = 'BudgetExhaustedError'
   }

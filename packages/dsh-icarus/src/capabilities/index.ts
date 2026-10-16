@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url'
 import type { MissionService, MissionRevision } from '../domain/index.js'
 import type { IcarusDatabase } from '../storage/index.js'
 import type { IcarusContext, HostAgent, ToolResult } from '../types/host.js'
+import type { SearchService } from '../search/service.js'
+import { SearchUnavailableError } from '../search/types.js'
 
 export type CapabilityStatus = 'available' | 'missing' | 'needs_auth' | 'unavailable' | 'unknown'
 export interface CapabilityCheck {
@@ -28,13 +30,15 @@ export interface CapabilityService {
   capture(missionId: string, runId: string | null, sessionId: string, callId: string, tool: string, result: ToolResult): string
 }
 
-export function createCapabilityService(ctx: IcarusContext, database: IcarusDatabase, missions: MissionService): CapabilityService {
+export function createCapabilityService(ctx: IcarusContext, database: IcarusDatabase, missions: MissionService, search?: SearchService): CapabilityService {
   const { db, paths } = database
   function capture(missionId: string, runId: string | null, sessionId: string, callId: string, tool: string, result: ToolResult): string {
     const existing = db.prepare('SELECT evidenceRef FROM ToolReading WHERE sessionId = ? AND callId = ?').get<{ evidenceRef: string }>(sessionId, callId)
     if (existing !== undefined) return existing.evidenceRef
     const id = newId('tool_reading')
-    const ref = writeArtifact(paths, `missions/${missionId}/tools/${id}.json`, JSON.stringify({ tool, sessionId, callId, result, scope: 'tool_result', truncated: null, continuation: null }))
+    const scope = tool === 'icarus_web_search' ? 'snippet' : tool === 'icarus_web_fetch' ? 'vendor_extract' : 'tool_result'
+    const value = result.value as { truncated?: boolean } | undefined
+    const ref = writeArtifact(paths, `missions/${missionId}/tools/${id}.json`, JSON.stringify({ tool, sessionId, callId, result, scope, truncated: value?.truncated ?? null, continuation: null }))
     db.prepare('INSERT INTO ToolReading(id, missionId, runId, sessionId, callId, tool, evidenceRef, isError, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(sessionId, callId) DO NOTHING')
       .run(id, missionId, runId, sessionId, callId, tool, ref, result.isError ? 1 : 0, Date.now())
     return ref
@@ -44,7 +48,19 @@ export function createCapabilityService(ctx: IcarusContext, database: IcarusData
     for (const requirement of revision.capabilityRequirements ?? []) {
       let status: CapabilityStatus = 'unknown'
       let evidenceRef: string | null = null
-      if (ctx.tools.get(requirement.tool, agent) === undefined) status = 'missing'
+      if (requirement.tool === 'icarus_web_search' && search !== undefined) {
+        const callId = newId('capability_probe')
+        try {
+          const result = await search.test(undefined, signal, { missionId: revision.missionId, sessionId: agent.id, purpose: 'capability-check', test: true })
+          evidenceRef = capture(revision.missionId, null, agent.id, callId, requirement.tool, { content: [{ type: 'text', text: JSON.stringify(result) }], value: result })
+          status = 'available'
+        } catch (error) {
+          if (!(error instanceof SearchUnavailableError)) throw error
+          const configured = error.providers.filter(item => item.status !== 'unconfigured')
+          status = configured.length === 0 ? 'missing' : configured.every(item => item.status === 'auth_failed') ? 'needs_auth' : 'unavailable'
+          evidenceRef = capture(revision.missionId, null, agent.id, callId, requirement.tool, { isError: true, content: [{ type: 'text', text: JSON.stringify({ message: error.message, providers: error.providers }) }] })
+        }
+      } else if (ctx.tools.get(requirement.tool, agent) === undefined) status = 'missing'
       else if (requirement.verificationArgs !== undefined) {
         const callId = newId('capability_probe')
         const result = await ctx.tools.execute({ agent, name: requirement.tool, arguments: requirement.verificationArgs, callId, signal })

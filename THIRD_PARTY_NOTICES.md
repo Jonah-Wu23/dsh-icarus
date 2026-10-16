@@ -1,6 +1,6 @@
 # Third-party notices
 
-截至 2026-10-15，本仓库包含原创插件源码、产品文档及用户提供的研究材料。插件声明宿主 peer 依赖 `@deepseek-ai/cordis`，运行依赖见「插件运行依赖」一节，开发依赖包括 TypeScript 与类型声明。第三方宿主与 Bot 实现未复制进仓库。M3 已在本机安装 `dsh-mcp-manager@0.6.0` 与 `@anweat/dsh-browser@0.2.1`，并通过 Fetch MCP `2026.10.10` 完成真实网页读取；其余候选扩展保持推荐状态。QQ 协议适配器尚未实现，NapCat 未随项目分发。
+截至 2026-10-16，本仓库包含原创插件源码、产品文档及用户提供的研究材料。插件声明宿主 peer 依赖 `@deepseek-ai/cordis` 与搜索、凭据及界面服务，运行依赖见「插件运行依赖」一节，开发依赖包括 TypeScript、esbuild 与类型声明。第三方宿主与 Bot 实现未复制进仓库。M3 已在本机安装 `dsh-mcp-manager@0.6.0` 与 `@anweat/dsh-browser@0.2.1`，并通过 Fetch MCP `2026.10.10` 完成真实网页读取；其余候选扩展保持推荐状态。QQ 协议适配器尚未实现，NapCat 未随项目分发。
 
 ## 项目许可证
 
@@ -28,6 +28,7 @@ Icarus 原创内容采用根目录 [Apache License 2.0](LICENSE)，Copyright 202
 | @mozilla/readability 0.6.0 | Apache-2.0 | 公开网页的正文提取 |
 | linkedom 0.18.13 | ISC | Readability 所需的 DOM 实现 |
 | @anweat/dsh-browser 0.2.1 | MIT | 后台工作区的浏览器工具，见下文「本机已安装并真实调用的扩展」 |
+| @deepseek-ai/schemastery 3.18.4 | MIT | 与桌面宿主一致的配置 schema，提供搜索设置的 volatile 字段 |
 
 以上版本由 pnpm lockfile 固定。传递依赖按 `pnpm licenses list --prod` 的实际结果登记：
 
@@ -41,6 +42,14 @@ Icarus 原创内容采用根目录 [Apache License 2.0](LICENSE)，Copyright 202
 | PSF-2.0、Python-2.0 | argparse 3.0.2、2.0.1 |
 
 TypeScript 5.9.3（Apache-2.0）与 @types/markdown-it 14.2.0、@types/linkify-it 5.0.0、@types/mdurl 2.0.0（MIT）只在构建阶段使用，不进入运行模块。
+
+esbuild 0.25.12（MIT）用于构建浏览器端模块；@types/react 18.3.1（MIT）用于构建期类型检查。React 与宿主界面控件由 DSH 的模块加载器提供。
+
+## 均衡搜索移植
+
+`src/search/clients.ts` 的三家请求参数与响应字段映射参考并移植自 [tianmingwan/dsh-balanced-search](https://github.com/tianmingwan/dsh-balanced-search)，版本 `0.2.0`，提交 `6278313`，上游采用 MIT，Copyright (c) 2026 tianmingwan。凭据读取、持久状态、预算与证据记录由 Icarus 实现，未安装上游插件。
+
+完整 MIT 许可与版权声明保存在 [插件 NOTICE](packages/dsh-icarus/NOTICE)，随插件文件一起分发。Keenable、Exa 和 Tavily 为独立外部服务，查询与正文抽取遵守各自服务条款。
 
 实际引入或分发第三方代码时，登记具体版本、来源与许可证，保留对应版权声明及上游 NOTICE。外部服务、模型权重和内容来源分别遵循其自身条款。
 

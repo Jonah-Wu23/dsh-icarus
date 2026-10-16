@@ -10,11 +10,12 @@ Icarus is your personal AI partner in DeepSeek Harness, built for research and e
 
 ## 当前状态
 
-已完成产品规格、仓库初始化、M1 插件工程、M2 委托执行链与 M3 持续关注链。插件可构建并安装到桌面 profile：BotBridge 打通真实交付，Mission 支持版本快照、按日程调度、租约与代次、重启恢复、预算闸门、审批绑定与错误档案；M2 总验收已在真实桌面宿主上逐步通过。M3 已接入四种原生来源、资料与能力绑定、分批评估及交付窗口，并通过真实业务验收；反馈在 M4，完整界面与 QQ 接入在 M5。MCP 管理器与浏览器扩展已完成本机安装与后台调用，其余推荐扩展保持候选状态。
+已完成产品规格、仓库初始化、M1 插件工程、M2 委托执行链与 M3 持续关注链。插件可构建并安装到桌面 profile：BotBridge 打通真实交付，Mission 支持版本快照、按日程调度、租约与代次、重启恢复、预算闸门、审批绑定与错误档案；M2 总验收已在真实桌面宿主上逐步通过。M3 已接入四种原生来源、资料与能力绑定、分批评估及交付窗口，并通过真实业务验收；M3.99 补齐联网搜索，三家服务按剩余免费额度分摊，搜索摘要与厂商正文抽取进入证据与预算，设置页可填写 key、测试连接、查看本月用量，并可选让 DSH 内置搜索接管。反馈在 M4，完整界面与 QQ 接入在 M5。MCP 管理器与浏览器扩展已完成本机安装与后台调用，其余推荐扩展保持候选状态。
 
 - [最终 PRD](docs/PRD.md)：产品范围、架构与发布验收的实施依据。
 - [开发计划](docs/DEVELOPMENT_PLAN.md)：任务依赖、阶段交付与真实运行验收。
 - [M3 开发计划](docs/M3_PLAN.md)：持续关注、按需扩展与准点交付的具体实施顺序。
+- [M3.99 计划](docs/M3.99_PLAN.md)：三家搜索服务、设置页、搜索来源与可选接管的实施与验收。
 - [用户需求与扩展建议](docs/M3_BEGIN.md)：首批用户需求及 MCP、DSH 插件候选。
 - [设计哲学](PHILOSOPHY.md)：人格、任务与反馈的设计原则。
 - [第三方说明](THIRD_PARTY_NOTICES.md)：参考材料与外部组件的使用关系。
@@ -28,7 +29,7 @@ Icarus 作为独立 DeepSeek Harness 插件，拥有 Mission、成果与反馈�
 
 已核查的本机兼容目标为桌面宿主 `0.2.0-rc.2` 与 `ds-bot@0.1.6`。现有语音采用本地识别与浏览器朗读。Node.js/TypeScript 为实现语言，SQLite 为单主持久化存储。
 
-插件源码位于 `packages/dsh-icarus`：TypeScript 编写，`tsc` 编译为 ESM 到 `lib/`，宿主提供的 peer 依赖不重复安装。BotBridge 连接稳定身份与当前会话，M3 已接入 RSS/Atom、arXiv、GitHub 与网页变化来源。来源游标、原始证据和实际阅读范围持久保存；模型结合选定项目文件及 Bot 背景，每批评估最多 20 条候选，通过原生工具提交评估及要求核对，再按约定时间交付。
+插件源码位于 `packages/dsh-icarus`：TypeScript 编写，`tsc` 编译为 ESM 到 `lib/`，宿主提供的 peer 依赖不重复安装。BotBridge 连接稳定身份与当前会话，M3 已接入 RSS/Atom、arXiv、GitHub 与网页变化来源，M3.99 增加按查询式定期检索的搜索来源。来源游标、原始证据和实际阅读范围持久保存；模型结合选定项目文件及 Bot 背景，每批评估最多 20 条候选，通过原生工具提交评估及要求核对，再按约定时间交付。
 
 来源采集、成果准备和投递分别调度。空轮询不调用模型；来源失败保留错误与恢复时间，按委托去重通知。GitHub 来源共享持久请求额度：未认证请求至少间隔两分钟，认证后至少间隔两秒，并遵守上游剩余额度及重置时间。`icarus_sources` 的 `requestBudget` 操作可查询额度记录。
 
@@ -52,6 +53,43 @@ DSH 插件候选包括 [dsh-market](https://github.com/dsh-market/dsh-market) �
 
 具体上游链接与第三方使用关系见 [第三方说明](THIRD_PARTY_NOTICES.md)。版本声明、已安装、已连接和本机后台调用分别记录；所选扩展通过桌面 `0.2.0-rc.2` 验证后才写入可用配置。缺少认证或扩展离线时保留原委托与进度，显示需要完成的连接步骤。
 
+## 联网搜索
+
+打开 DSH「插件 → dsh-icarus → 联网搜索」，填写至少一家 API key，点击“保存并测试”。卡片显示凭据来源、连接结果及本月用量。填写多家后按剩余免费额度占比分摊请求，服务失败时自动切换；认证失败须修改 key 或重新测试，限流与暂时故障按冷却时间恢复。搜索结果和每次调用的计量进入本机证据记录。
+
+申请步骤与额度核对日期：2026-10-16。
+
+| 服务 | 申请步骤 | 免费额度 |
+|---|---|---|
+| Keenable | 在 [登录页](https://app.keenable.ai/login) 注册，进入 [Console](https://app.keenable.ai/console) 创建 Icarus 专用 key，复制以 `keen_` 开头的 key 到卡片并保存 | [每月 100,000 次请求](https://docs.keenable.ai/credits)，搜索与抓取通常每次 1 credit；按厂商实际返回计量 |
+| Exa | 在 [Dashboard](https://dashboard.exa.ai) 用邮箱注册，打开 API Keys 创建名为 Icarus 的 key，复制到卡片并保存；免费档无需绑卡 | [每月 10 美元额度，另有 10 美元注册奖励](https://exa.ai/pricing)；Icarus 按每月 10 美元控制调用 |
+| Tavily | 在 [Tavily](https://app.tavily.com) 注册，在 API Keys 点 + 新建，Key Type 选 Development，Monthly Limit 填 1000；复制以 `tvly-` 开头的 key 并保存 | [每月 1,000 credits](https://docs.tavily.com/documentation/api-credits)，每月 1 日重置；基础搜索每次 1 credit，深入搜索每次 2 credits；基础抽取每 5 个成功 URL 消耗 1 credit |
+
+只填一家也能使用。key 经宿主凭据服务保存在本机 `~/.dsh/.credentials.yaml`，为明文保存，同一 Windows 账户的程序可读取；建议每家单独为 Icarus 新建 key。系统环境变量中的同名 key 优先，卡片显示只读来源；需在系统设置中修改。非本机地址打开的页面只显示设置。
+
+`icarus_web_search` 支持 `query`、`maxResults`（1–20）、`timeRange` 和 Tavily 的 `depth`。`icarus_web_fetch` 支持 `url` 与 `maxChars`（最多 50,000）。执行提示要求搜索词只写主题；正文优先使用已绑定的 Fetch MCP 或浏览器，读取失败后使用厂商抽取。阅读记录把搜索摘要标为 `snippet`，厂商正文标为 `vendor_extract`；抽取返回 `originStatus: null`，原站状态未知。
+
+搜索查询和抓取 URL 会发送给选中的厂商，抓取由其服务器完成。返回结果保存在本机 Icarus 数据目录，作为成果证据；SearchCall 记录提供者、状态与计量，并关联对应的 Mission、Run 或普通 Session。卡片用量按 Icarus 记录统计，厂商后台为准；未返回实际费用时保留预算预留并显示费用未知。
+
+`icarus_sources create` 支持 `adapter: search`，`locator` 为查询式，`config` 可设置 `timeRange`、`maxResults` 和 `site`。默认每 6 小时检索，最短 1 小时；创建时自动绑定必需搜索能力。结果按 URL 与内容去重后进入 Observation，沿用委托的评估和交付流程。
+
+Mission 的 `searchBudget: { perRun, perMonth }` 随 revision 保存。搜索来源默认每次执行 10 次，普通委托默认 20 次，每月默认 600 次；调用前预留次数，失败尝试同样保留调用记录。超过上限时执行终止为 `budget_exhausted`，已有证据保留。付费调用须有对应 Mission 的明确授权，并设置 `searchBudget.allowPaid: true`。删除委托会删除查询及证据，匿名的提供者计量继续计入免费额度。
+
+高级区块可开启“让 DSH 内置搜索也使用这些服务”，须至少一家连接测试通过。开关修改当前 profile 的 `web` 配置，卡片显示实际生效的 provider，并提示重启核查；关闭后恢复下层配置，本机为 `auto`。`web_fetch` 保持 `http`。内置搜索的调用记为 `host-web-search`，进入提供者月度统计。
+
+| 页面状态 | 处理 |
+|---|---|
+| 未填写 | 申请一家服务的 key，保存后自动测试 |
+| key 无效 | 到厂商后台确认 key 状态，重新粘贴或手动测试；保留实际的 HTTP 400、401 或 403 |
+| 本月额度已用完 | 等待页面给出的恢复时间，或核查厂商后台后重新测试；重置时间未知时等待手动测试 |
+| 请求太频繁 | 按厂商 `Retry-After` 冷却，没有该字段时等待 60 秒 |
+| 暂时连不上 | 展开原始错误查看网络或服务原因；冷却 2 分钟后重试 |
+| 接管未生效 | 重启 DSH 后核查卡片中的实际 provider |
+| 宿主缺少服务 | 按卡片列出的服务名核对宿主编排与 profile 的插件集；搜索工具本身仍可用 |
+| 宿主接口不兼容 | 按 [M3.99 计划](docs/M3.99_PLAN.md) 第 3.3 节逐项核对宿主接口，升级宿主后重新加载 |
+
+桌面兼容目标为 `0.2.0-rc.2`；升级宿主时按 [M3.99 计划](docs/M3.99_PLAN.md) 复核搜索 seam、凭据接口和私有 RPC。
+
 ## QQ 接入计划
 
 首个移动渠道采用 **NapCatQQ + OneBot 11 私聊**。常驻主机运行独立 NapCat 进程，登录专用 QQ 账号；Icarus 连接其本机 WebSocket 服务，向用户绑定的本人 QQ 发送简报，并接收反馈与追问。任务和模型执行仍由 Icarus 与 DSH 管理。
@@ -67,7 +105,7 @@ M5 按顺序完成账号登录与连接认证、本人身份绑定、outbox 定�
 ```powershell
 cd E:\AI\dsh-icarus\packages\dsh-icarus
 pnpm install --frozen-lockfile
-pnpm build      # tsc 产出 ESM 到 lib/
+pnpm build      # tsc 产出 ESM，esbuild 构建浏览器端模块到 lib/
 pnpm test       # node:test，验证身份解析（读取 lib/ 产物，需先 build）
 ```
 

@@ -53,6 +53,7 @@ export interface Executor {
 }
 
 export interface ExecutorOptions {
+  readonly search?: import('../search/service.js').SearchService | undefined
   readonly curation: CurationService
   readonly windows: WindowService
   readonly capabilities: CapabilityService
@@ -211,6 +212,27 @@ export function createExecutor(options: ExecutorOptions): Executor {
   const unloading = new AbortController()
   let disposed = false
   const budgetFailures = new Map<string, Error>()
+  options.search?.handlers({
+    budget(owner, error) {
+      if (owner.runId === undefined) return
+      budgetFailures.set(owner.runId, error)
+      const turn = [...turns.values()].find(turn => turn.runId === owner.runId)
+      if (turn !== undefined) {
+        const run = store.get(owner.runId)
+        if (run.sessionId !== null) ctx.sessionController.cancel({ sessionId: run.sessionId })
+      }
+    },
+    failure(owner, failure, errorRef) {
+      if (owner.missionId === undefined || failure.status !== 'auth_failed') return
+      options.faults.record({ missionId: owner.missionId, kind: 'search', conditionKey: `search:${failure.provider}`,
+        errorRef, ...(owner.runId === undefined ? {} : { runId: owner.runId }),
+        detail: { provider: failure.provider, status: failure.status, httpStatus: failure.httpStatus,
+          message: '请在 DSH 插件 → Icarus → 联网搜索 更新 key 并测试连接。全部 key 无效时关闭内置搜索接管。' } })
+    },
+    success(provider) {
+      options.database.db.prepare('UPDATE Fault SET clearedAt = ? WHERE kind = ? AND conditionKey = ? AND clearedAt IS NULL').run(Date.now(), 'search', `search:${provider}`)
+    },
+  })
   const modelBudget = installModelBudget({
     ctx,
     database: options.database,
@@ -255,7 +277,8 @@ export function createExecutor(options: ExecutorOptions): Executor {
     if (run.deliveryWindowId === null) return decision
     const content = decision.content ?? result.content
     const ref = options.capabilities.capture(run.missionId, run.id, request.agent!.id, request.callId, request.name, { ...result, content })
-    return { ...decision, content: [...content, { type: 'text', text: JSON.stringify({ icarusEvidence: { ref, scope: 'tool_result', truncated: null, isError: result.isError === true } }) }] }
+    const record = JSON.parse(readArtifact(paths, ref)) as { scope: string; truncated: boolean | null }
+    return { ...decision, content: [...content, { type: 'text', text: JSON.stringify({ icarusEvidence: { ref, scope: record.scope, truncated: record.truncated, isError: result.isError === true } }) }] }
   })
 
   ctx.on('session/event', (session, event) => {
@@ -468,6 +491,7 @@ export function createExecutor(options: ExecutorOptions): Executor {
     const pad = (value: number): string => String(value).padStart(2, '0')
     const lines = [
       'Icarus 执行会话：为下面的委托产出一次成果。只输出成果正文，不要复述本段要求。',
+      '联网搜索使用 icarus_web_search，搜索词只写主题，不发送个人资料或项目文件原文。正文优先使用已绑定的 Fetch MCP 或浏览器；读取失败或被代理拦截时使用 icarus_web_fetch，其范围为 vendor_extract，搜索摘要范围为 snippet。',
       '',
       `委托目标：${revision.objective}`,
       `委托类型：${revision.kind === 'once' ? '单次' : '循环'}`,

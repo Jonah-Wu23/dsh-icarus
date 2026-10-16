@@ -104,12 +104,29 @@ export interface HostToolDefinition extends ToolSchema {
 }
 
 export interface IcarusContext {
+  readonly icarus: import('../index.js').IcarusService
+  inject(services: readonly string[], callback: (ctx: IcarusContext) => void): unknown
+  /** Read a service without declaring it: `undefined` while absent or still loading. */
+  get(name: string): unknown
+  readonly web: {
+    readonly searchProviderId?: string
+    readonly fetchProviderId?: string
+    registerSearchProvider(provider: { readonly id: string; available(): boolean; search(request: { readonly query: string; readonly maxResults?: number }, signal?: AbortSignal): Promise<unknown> }): () => void
+  }
+  readonly connection: {
+    readonly rpc: { handle(channel: string, handler: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>): () => Promise<void> }
+  }
+  readonly settings: { readonly writable: boolean }
+  readonly configEditor: {
+    entries(): readonly { readonly options: { readonly id: string; readonly name: string }; readonly fiber?: unknown }[]
+    edit(entry: { readonly options: { readonly id: string; readonly name: string } }, change: (current: Record<string, unknown>, inherited: Record<string, unknown>) => Record<string, unknown>): Promise<void>
+  }
   readonly agents: {
     get(id: string): HostAgent | undefined
   }
   readonly credentials: {
     resolve(ref: string): Promise<{ readonly value: string; readonly source: string } | undefined>
-    describe(ref: string): Promise<{ readonly configured: boolean }>
+    describe(ref: string): Promise<{ readonly configured: boolean; readonly source?: string; readonly writable?: boolean }>
   }
   readonly tools: {
     schemas(scope?: HostAgent): readonly ToolSchema[]
@@ -122,6 +139,7 @@ export interface IcarusContext {
   effect(execute: () => (() => void) | void, label?: string): void
   /** Session lifecycle events, including `turn/end` for Icarus-owned execution Sessions. */
   on(event: 'session/event', listener: (session: SessionLike, event: SessionEventLike) => void): void
+  on(event: 'credentials/reference-updated', listener: (ref: string) => void | Promise<void>): void
   on(event: 'llm/stream', listener: (request: ModelRequest, next: () => AsyncIterable<ModelChunk>) => AsyncIterable<ModelChunk>): void
   on(event: 'agent/request', listener: (request: { readonly agent: { readonly session: { readonly id: string } } }, next: () => Promise<Record<string, unknown>>) => Promise<Record<string, unknown>>): void
   on(event: 'tools/execute', listener: (request: { readonly agent?: { readonly session: { readonly id: string } } }, next: () => Promise<unknown>) => Promise<unknown>): void

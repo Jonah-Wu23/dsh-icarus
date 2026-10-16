@@ -356,6 +356,7 @@ function toMission(row: MissionRow, awaitingReschedule: boolean): Mission {
 
 function bindingFields(value: MissionBindings): MissionBindings {
   return {
+    ...(value.searchBudget === undefined ? {} : { searchBudget: value.searchBudget }),
     ...(value.workspaceRef === undefined ? {} : { workspaceRef: value.workspaceRef }),
     ...(value.contextRefs === undefined ? {} : { contextRefs: value.contextRefs }),
     ...(value.capabilityRequirements === undefined ? {} : { capabilityRequirements: value.capabilityRequirements }),
