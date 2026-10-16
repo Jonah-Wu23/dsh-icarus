@@ -64,7 +64,7 @@ test('a Mission that used up its budget is refused at the next due time', async 
   assert.deepEqual(first.outcomes.map(outcome => outcome.status), ['succeeded'])
   assert.equal(harness.missions.get(mission.id).budgetUsed, 100)
   assert.equal(harness.host.created.length, 1)
-  assert.equal(harness.host.prompts.length, 2, 'execution prompt plus delivery')
+  assert.equal(harness.host.prompts.length, 2, 'the result prompt and the requirement check; delivery belongs to the outbox scan')
 
   const runs = createRunStore(harness.database, { missions: harness.missions, now: harness.now })
   makeDue(harness.database, mission.id, harness.now())
@@ -85,7 +85,8 @@ test('a Run that overshoots its reservation still delivers and records the overs
 
   const report = await execution.runs.tick()
   assert.deepEqual(report.outcomes.map(outcome => outcome.status), ['succeeded'])
-  assert.match(report.outcomes[0].detail, /outbox sent/)
+  assert.match(report.outcomes[0].detail, /outbox pending/)
+  await execution.outbox.tick()
 
   const run = execution.runs.get(report.enqueued[0])
   assert.equal(run.status, 'succeeded')
@@ -128,14 +129,23 @@ test('a Run that overshoots its reservation still delivers and records the overs
 })
 
 test('a failing requirement check stays failed even when the Run also overshoots', async t => {
-  const harness = openHarness(t, { text: '太短了。', usage: { inputTokens: 50, outputTokens: 50 } })
+  const harness = openHarness(t, {
+    text: '太短了。',
+    usage: { inputTokens: 50, outputTokens: 50 },
+    verification: JSON.stringify({
+      objective: { passed: true, reason: '成果表达了委托目标。', evidenceRefs: [] },
+      results: [{ requirement: '含来源引用', passed: false, reason: '正文没有给出可访问的来源链接。', evidenceRefs: [] }],
+      evidenceRefs: [],
+      readingClaims: [],
+    }),
+  })
   const execution = executionOf(harness)
   const mission = harness.missions.create(baseMission({ budget: 10 }))
   makeDue(harness.database, mission.id, harness.now())
 
   const report = await execution.runs.tick()
   assert.deepEqual(report.outcomes.map(outcome => outcome.status), ['failed'])
-  assert.match(report.outcomes[0].detail, /R2 length floor/)
+  assert.match(report.outcomes[0].detail, /含来源引用：正文没有给出可访问的来源链接。/)
   const run = execution.runs.get(report.enqueued[0])
   assert.equal(run.status, 'failed')
   assert.equal(harness.missions.get(mission.id).budgetUsed, 100, 'a failed Run settles what it spent')
@@ -209,6 +219,7 @@ test('a null budget has no gate and still accumulates usage', async t => {
   assert.equal(run.deliverables.length, 1)
   assert.equal(harness.missions.get(mission.id).budgetUsed, 10_000)
   assert.deepEqual({ ...run.budget }, { budget: null, budgetUsed: 10_000, reserved: 0, remaining: null })
+  await execution.outbox.tick()
   assert.equal(harness.host.prompts.filter(request => request.sessionId === CHIEF_SESSION).length, 1)
 })
 

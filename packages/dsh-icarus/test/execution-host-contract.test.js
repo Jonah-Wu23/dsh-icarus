@@ -36,7 +36,7 @@ test('the prompt is admitted with an AbortSignal, and the Run only succeeds beca
   // A run that reached succeeded proves the prompt was admitted: the harness stub rejects a call
   // without a signal, exactly as the real gateway does.
   assert.deepEqual(report.outcomes.map(outcome => outcome.status), ['succeeded'])
-  assert.equal(harness.host.promptSignals.length, 2, 'execution prompt plus delivery prompt')
+  assert.equal(harness.host.promptSignals.length, 2, 'the result prompt and the requirement check')
   for (const signal of harness.host.promptSignals) {
     assert.ok(signal instanceof AbortSignal, 'every prompt gets an AbortSignal')
     assert.equal(signal.aborted, false, 'neither admission was cancelled')

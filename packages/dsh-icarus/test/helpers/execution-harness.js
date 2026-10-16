@@ -1,6 +1,6 @@
 // Shared harness for the execution tests: a temp data home with a fake Bot roster, a fake
-// host context (logger, sessionController, session/event, interval, provide) and helpers for
-// emitting turn events. Not a test file: the runner only picks up `*.test.js`.
+// host context (logger, sessionController, tools, session/event, interval, provide) and
+// helpers for emitting turn events. Not a test file: the runner only picks up `*.test.js`.
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -97,10 +97,29 @@ export function completeTurn(host, sessionId, text, usage) {
   host.emit(sessionId, turnEndEvent({ kind: 'completed' }))
 }
 
-/** A result that satisfies the M2.3 structural rules for the given requirements. */
+/** A result body long enough to be a deliverable, with one source link. */
 export function goodResult(requirements = []) {
   const sections = requirements.map(requirement => `## ${requirement}\n\n${'这一条要求的回应正文足够长，包含具体结论与依据。'.repeat(3)}`).join('\n\n')
   return `背景与结论\n\n${'本次成果正文覆盖委托目标，并给出可核对的事实与判断。'.repeat(10)}\n\n${sections}\n\n来源：https://arxiv.org/abs/2610.00001\n`
+}
+
+/** The requirement list a check prompt carries, read the way the model reads it: `要求：["…"]`. */
+export function requirementsAskedIn(prompt) {
+  const line = /^要求：(.*)$/m.exec(prompt)
+  return line === null ? [] : JSON.parse(line[1])
+}
+
+/** Opening of the executor's requirement check, the one prompt whose answer must be JSON. */
+export const CHECK_PROMPT = '请核对成果是否满足用户目标及每项要求。'
+
+/** The verification object `checkDeliverable` accepts when the objective and every requirement pass. */
+export function goodVerification(requirements = []) {
+  return JSON.stringify({
+    objective: { passed: true, reason: '成果覆盖了委托目标。', evidenceRefs: [] },
+    results: requirements.map(requirement => ({ requirement, passed: true, reason: '成果满足该要求。', evidenceRefs: [] })),
+    evidenceRefs: [],
+    readingClaims: [],
+  })
 }
 
 /** Writes the Bot roster so `resolveIdentity('Chief')` resolves, and returns the fake host. */
@@ -121,10 +140,22 @@ export function createFakeHost(options = {}) {
     for (const entry of listeners) entry.listener({ id: sessionId }, event)
   }
   host.logged = level => logs.filter(entry => entry[0] === level).map(entry => entry.slice(1).join(' '))
-  host.onPrompt = options.onPrompt ?? (async request => {
+  const answerResult = options.onPrompt ?? (async request => {
     queueMicrotask(() => completeTurn(host, request.sessionId, options.text ?? goodResult(options.requirements ?? []), options.usage))
     return { accepted: true }
   })
+  host.onPrompt = answerResult
+  /**
+   * Every Run takes two model turns: the result, then the requirement check the executor asks for
+   * as JSON. The fake model answers the check itself, so a test's own `onPrompt` only ever writes
+   * result turns — and the check turn reports no usage, which keeps each test's arithmetic about
+   * its own turn.
+   */
+  function answerCheck(request) {
+    const answer = options.verification ?? goodVerification(requirementsAskedIn(request.content[0].text))
+    queueMicrotask(() => completeTurn(host, request.sessionId, answer))
+    return { accepted: true }
+  }
   host.ctx = {
     logger: {
       info: (...args) => logs.push(['info', ...args]),
@@ -148,8 +179,23 @@ export function createFakeHost(options = {}) {
         promptSignals.push(signal)
         signal.throwIfAborted()
         prompts.push(request)
-        return host.onPrompt(request, host)
+        const answer = request.content[0].text.startsWith(CHECK_PROMPT) ? answerCheck(request) : host.onPrompt(request, host)
+        // Admission ends when the caller's lifetime does: an abort rejects the call with the
+        // signal's reason even while the answer is still holding the admission open.
+        let onAbort
+        const aborted = new Promise((_, reject) => {
+          onAbort = () => reject(signal.reason)
+          signal.addEventListener('abort', onAbort, { once: true })
+        })
+        try {
+          return await Promise.race([answer, aborted])
+        } finally {
+          signal.removeEventListener('abort', onAbort)
+        }
       },
+    },
+    tools: {
+      register: () => () => {},
     },
     on(event, listener) {
       if (event === 'session/event') listeners.push({ listener })

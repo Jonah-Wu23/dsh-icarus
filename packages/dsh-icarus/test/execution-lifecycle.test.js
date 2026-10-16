@@ -174,7 +174,9 @@ test('a committed Run cannot be finished again', t => {
     status: 'pending',
     attemptCount: 0,
     receiptRef: null,
-    nextAttemptAt: null,
+    // The row is due as soon as it is committed; a windowed Run waits for its window instead.
+    nextAttemptAt: NOW,
+    purpose: 'deliverable',
   })
   assert.throws(() => store.finish(run.id, 'instance-a', { status: 'failed', usage: null }), SupersededError)
   assert.equal(store.get(run.id).status, 'succeeded')

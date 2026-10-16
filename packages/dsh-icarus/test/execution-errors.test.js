@@ -64,7 +64,14 @@ test('a Run that delivers after a refusal writes no failure archive at all', asy
 })
 
 test('a failed Run keeps the whole approval chain and the raw tool error', async t => {
-  const harness = openHarness(t, {})
+  const harness = openHarness(t, {
+    verification: JSON.stringify({
+      objective: { passed: false, reason: '成果没有完成委托目标。', evidenceRefs: [] },
+      results: [{ requirement: '含来源引用', passed: false, reason: '成果没有给出可访问的来源链接。', evidenceRefs: [] }],
+      evidenceRefs: [],
+      readingClaims: [],
+    }),
+  })
   const execution = executionOf(harness)
   harness.host.onPrompt = async (request, host) => {
     if (!request.sessionId.startsWith('session-run-')) return { accepted: true }
@@ -87,7 +94,7 @@ test('a failed Run keeps the whole approval chain and the raw tool error', async
   assert.deepEqual(report.outcomes.map(outcome => outcome.status), ['failed'])
   const run = execution.runs.get(report.enqueued[0])
   assert.equal(run.status, 'failed')
-  assert.equal(run.deliverables.length, 0, 'a failed Run delivers nothing')
+  assert.deepEqual(run.deliverables.map(item => item.outbox[0].purpose), ['fault'], 'a failed Run delivers no result, only its fault notice')
 
   const archive = archiveOf(harness, run)
   assert.match(archive, /^Icarus Run .* failure archive/)

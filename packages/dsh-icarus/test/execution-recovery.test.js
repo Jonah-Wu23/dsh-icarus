@@ -86,6 +86,7 @@ test('editing an in-flight once Mission re-arms it, and the next pass runs the n
   harness.clock.at += 5_000
   const second = await execution.runs.tick()
   assert.deepEqual(second.outcomes.map(outcome => outcome.status), ['succeeded'])
+  await execution.outbox.tick()
   const runs = execution.runs.list({ missionId: mission.id })
   assert.deepEqual(runs.map(run => [run.status, run.missionRevision, run.generation]), [
     ['superseded', 1, 1],

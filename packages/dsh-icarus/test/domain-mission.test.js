@@ -264,6 +264,10 @@ test('editing an active once Mission schedules its new revision after an earlier
     VALUES ('run_done', ?, 1, 'succeeded', '[]', '[]', 1, ?)`).run(created.id, NOW)
   database.db.prepare(`INSERT INTO Deliverable (id, runId, requirementResults, evidenceRefs, artifactRefs, content, contentHash, createdAt)
     VALUES ('del_done', 'run_done', '{}', '[]', '[]', '成果', 'hash', ?)`).run(NOW)
+  // A commit writes the Outbox row in the same transaction as its Deliverable, and the
+  // delivered check reads both: a Deliverable alone is not a delivery.
+  database.db.prepare(`INSERT INTO Outbox (id, deliverableId, channel, status, purpose, createdAt, updatedAt)
+    VALUES ('out_done', 'del_done', 'bot', 'sent', 'deliverable', ?, ?)`).run(NOW, NOW)
 
   assert.equal(missions.get(created.id).awaitingReschedule, false)
   const edited = missions.modify(created.id, { objective: '按新的要求执行' })

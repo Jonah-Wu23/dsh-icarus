@@ -1,6 +1,6 @@
 // Executor: the full Run flow with a fake host — Session creation, the prompt built from the
-// pinned revision, turn collection, the requirement check, the deliverable, the delivery and
-// the Mission status that follows.
+// pinned revision, turn collection, the requirement check the model answers, the deliverable,
+// the delivery scan and the Mission status that follows.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, readFileSync } from 'node:fs'
@@ -43,6 +43,8 @@ test('a completed turn becomes a deliverable, an artifact, an outbox row and a B
   assert.deepEqual(report.errors, [])
   assert.equal(report.enqueued.length, 1)
   assert.deepEqual(report.outcomes.map(outcome => outcome.status), ['succeeded'])
+  // Delivery has its own scan: a committed Run leaves the Outbox row pending until it runs.
+  await execution.outbox.tick()
 
   const run = execution.runs.get(report.enqueued[0])
   assert.equal(run.status, 'succeeded')
@@ -62,16 +64,19 @@ test('a completed turn becomes a deliverable, an artifact, an outbox row and a B
   assert.equal(deliverable.contentHash.length, 64)
   assert.deepEqual([...deliverable.evidenceRefs], ['https://arxiv.org/abs/2610.00001'])
   assert.equal(deliverable.requirementResults.passed, true)
-  assert.deepEqual({ ...deliverable.outbox[0] }, {
+  const { receiptRef, ...outboxRow } = deliverable.outbox[0]
+  assert.deepEqual(outboxRow, {
     id: deliverable.outbox[0].id,
     deliverableId: deliverable.id,
     channel: 'bot',
     destinationRef: CHIEF_SESSION,
     status: 'sent',
     attemptCount: 1,
-    receiptRef: null,
     nextAttemptAt: null,
+    purpose: 'deliverable',
   })
+  assert.match(receiptRef, new RegExp(`^deliveries/${deliverable.outbox[0].id}/.+-receipt\\.json$`))
+  assert.equal(execution.outbox.receipt(deliverable.outbox[0].id).meaning, 'host_prompt_accepted')
 
   const sent = deliveredPrompts(harness)
   assert.equal(sent.length, 1)
@@ -93,7 +98,7 @@ test('the execution Session runs in the workspace and is prompted with the pinne
   assert.match(prompt.requestId, /^[0-9a-f-]{36}$/)
   assert.match(prompt.content[0].text, /委托目标：arXiv cs.AI 每日摘要/)
   assert.match(prompt.content[0].text, /1\. 含来源引用/)
-  assert.match(prompt.content[0].text, /## <要求原文>/)
+  assert.match(prompt.content[0].text, /（Mission revision 1）/)
   assert.match(prompt.content[0].text, /Asia\/Singapore/)
 })
 
@@ -105,28 +110,37 @@ test('a once Mission completes after a confirmed delivery', async t => {
 
   const report = await execution.runs.tick()
   assert.deepEqual(report.outcomes.map(outcome => outcome.status), ['succeeded'])
+  await execution.outbox.tick()
   assert.equal(harness.missions.get(mission.id).status, 'completed')
   assert.equal(harness.missions.get(mission.id).nextDueAt, null)
   assert.equal(execution.runs.get(report.enqueued[0]).usage.outputTokens, 45)
 })
 
 test('a result that fails the requirement check fails the Run and keeps the raw text', async t => {
-  const harness = openHarness(t, { text: '太短了。' })
+  const harness = openHarness(t, {
+    text: '太短了。',
+    verification: JSON.stringify({
+      objective: { passed: true, reason: '成果表达了委托目标。', evidenceRefs: [] },
+      results: [{ requirement: '含来源引用', passed: false, reason: '正文没有给出可访问的来源链接。', evidenceRefs: [] }],
+      evidenceRefs: [],
+      readingClaims: [],
+    }),
+  })
   const execution = executionOf(harness)
   const mission = harness.missions.create(baseMission())
   makeDue(harness.database, mission.id, harness.now())
 
   const report = await execution.runs.tick()
   assert.equal(report.outcomes[0].status, 'failed')
-  assert.match(report.outcomes[0].detail, /R2 length floor/)
+  assert.match(report.outcomes[0].detail, /含来源引用：正文没有给出可访问的来源链接。/)
   const run = execution.runs.get(report.enqueued[0])
   assert.equal(run.status, 'failed')
-  assert.equal(run.deliverables.length, 0)
+  assert.deepEqual(run.deliverables.map(item => item.outbox[0].purpose), ['fault'], 'the failure announces itself with a fault notice, not with a result')
   const raw = readFileSync(artifactFile(harness, run.errorRef), 'utf8')
   assert.match(raw, /kind: requirement-check/)
-  assert.match(raw, /R3 source marker/)
+  assert.match(raw, /正文没有给出可访问的来源链接。/)
   assert.match(raw, /太短了。/)
-  assert.equal(harness.database.db.prepare('SELECT COUNT(*) AS n FROM Outbox').get().n, 0)
+  assert.equal(harness.database.db.prepare("SELECT COUNT(*) AS n FROM Outbox WHERE purpose = 'deliverable'").get().n, 0)
   assert.equal(deliveredPrompts(harness).length, 0)
   assert.equal(harness.missions.get(mission.id).status, 'active')
 })

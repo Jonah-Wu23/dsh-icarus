@@ -57,6 +57,7 @@ test('an asked approval suspends the Run, and a grant resumes it to success', as
   assert.deepEqual(report.outcomes.map(outcome => outcome.status), ['succeeded'])
   // Waiting is an executing status: it is visible, it records the request, and it charges nothing.
   assert.deepEqual(seen, [{ status: 'awaiting_approval', chain: 1, budgetUsed: 0 }, { status: 'running' }])
+  await execution.outbox.tick()
 
   const run = execution.runs.get(report.enqueued[0])
   assert.equal(run.status, 'succeeded')
@@ -92,6 +93,7 @@ test('a refused approval that still produces a good result is delivered with the
 
   const report = await execution.runs.tick()
   assert.deepEqual(report.outcomes.map(outcome => outcome.status), ['succeeded'])
+  await execution.outbox.tick()
   const run = execution.runs.get(report.enqueued[0])
   assert.equal(run.status, 'succeeded', 'a refusal is not a reason to destroy a paid-for result')
   assert.equal(run.errorRef, null)

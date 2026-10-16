@@ -80,7 +80,7 @@ test('data locations resolve under $DSH_HOME/icarus', () => {
 test('opening creates the data spaces and sets WAL, busy_timeout and foreign keys', t => {
   const { database } = openHome(t)
 
-  assert.equal(database.schemaVersion, 3)
+  assert.equal(database.schemaVersion, MIGRATIONS.length)
   assert.equal(database.db.prepare('PRAGMA journal_mode').get().journal_mode, 'wal')
   assert.equal(database.db.prepare('PRAGMA busy_timeout').get().timeout, 5000)
   assert.equal(database.db.prepare('PRAGMA foreign_keys').get().foreign_keys, 1)
@@ -104,9 +104,9 @@ test('reopening the same file applies nothing and leaves the schema identical', 
     drop()
   })
   assert.equal(schemaDump(second.db), firstDump)
-  assert.deepEqual(firstMigrations, [1, 2, 3])
-  assert.deepEqual(migrationsOf(second.db), [1, 2, 3])
-  assert.equal(second.schemaVersion, 3)
+  assert.deepEqual(firstMigrations, MIGRATIONS.map(migration => migration.version))
+  assert.deepEqual(migrationsOf(second.db), MIGRATIONS.map(migration => migration.version))
+  assert.equal(second.schemaVersion, MIGRATIONS.length)
 })
 
 test('upgrading a 0001 database adds the approval chain without touching existing Runs', t => {
@@ -125,8 +125,8 @@ test('upgrading a 0001 database adds the approval chain without touching existin
     upgraded.close()
     drop()
   })
-  assert.equal(upgraded.schemaVersion, 3)
-  assert.deepEqual(migrationsOf(upgraded.db), [1, 2, 3])
+  assert.equal(upgraded.schemaVersion, MIGRATIONS.length)
+  assert.deepEqual(migrationsOf(upgraded.db), MIGRATIONS.map(migration => migration.version))
   assert.deepEqual(columnsOf(upgraded.db, 'Run').filter(name => name.startsWith('approval')), ['approvalRefs'])
   // The default is what keeps a pre-approval Run readable as an empty chain, not a null.
   const row = upgraded.db.prepare('SELECT approvalRefs, status FROM Run WHERE id = ?').get('run_legacy')

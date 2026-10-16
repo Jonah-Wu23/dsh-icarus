@@ -39,16 +39,20 @@ test('a confirmed delivery settles the row as sent and is not repeated', async t
 
   const attempt = await outbox.attempt(outboxId)
   assert.deepEqual({ ...attempt }, { outboxId, status: 'sent', destinationRef: CHIEF_SESSION, attempted: true })
-  assert.deepEqual({ ...outbox.get(outboxId) }, {
+  const { receiptRef, ...row } = outbox.get(outboxId)
+  assert.deepEqual(row, {
     id: outboxId,
     deliverableId,
     channel: 'bot',
     destinationRef: CHIEF_SESSION,
     status: 'sent',
     attemptCount: 1,
-    receiptRef: null,
     nextAttemptAt: null,
+    purpose: 'deliverable',
   })
+  // The receipt artifact is the record of what the host actually confirmed.
+  assert.match(receiptRef, new RegExp(`^deliveries/${outboxId}/.+-receipt\\.json$`))
+  assert.equal(outbox.receipt(outboxId).meaning, 'host_prompt_accepted')
 
   const again = await outbox.attempt(outboxId)
   assert.equal(again.attempted, false)
@@ -68,7 +72,7 @@ test('an unconfirmed delivery remains delivery_unknown without an automatic retr
   assert.equal(row.status, 'delivery_unknown')
   assert.equal(row.attemptCount, 1)
   assert.equal(row.nextAttemptAt, null)
-  assert.match(harness.host.logged('warn').join('\n'), /unconfirmed/)
+  assert.match(harness.host.logged('error').join('\n'), /unconfirmed/)
   assert.equal(harness.missions.get(mission.id).status, 'active', 'an unconfirmed send does not complete a Mission')
 })
 
@@ -90,7 +94,9 @@ test('a failed attempt can be retried as a new attempt on the same row', async t
     onPrompt: async request => {
       if (request.sessionId !== CHIEF_SESSION) return { accepted: true }
       deliveries += 1
-      if (deliveries === 1) throw new Error('channel down')
+      // Only a host code from the gateway's own vocabulary proves a refusal; anything else
+      // leaves the attempt unconfirmed and therefore not retried.
+      if (deliveries === 1) throw Object.assign(new Error('channel down'), { code: 'session/agent-busy' })
       return { accepted: true }
     },
   })
@@ -98,6 +104,8 @@ test('a failed attempt can be retried as a new attempt on the same row', async t
 
   assert.equal((await outbox.attempt(outboxId)).status, 'failed')
   assert.match(harness.host.logged('error').join('\n'), /channel down/)
+  // The failed row becomes eligible again once its retry delay has passed.
+  harness.clock.at += RETRY_DELAY
   const retry = await outbox.attempt(outboxId)
   assert.equal(retry.status, 'sent')
   const row = outbox.get(outboxId)
