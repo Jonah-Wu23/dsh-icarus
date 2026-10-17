@@ -19,6 +19,12 @@ declare module 'node:child_process' {
     once(event: 'error', listener: (error: Error) => void): void
     once(event: 'exit', listener: (code: number | null, signal: string | null) => void): void
   }
+  export function spawnSync(command: string, args: readonly string[], options?: { readonly cwd?: string; readonly encoding?: 'utf8'; readonly windowsHide?: boolean }): {
+    readonly status: number | null
+    readonly stdout: string
+    readonly stderr: string
+    readonly error?: Error
+  }
 }
 
 declare module 'node:fs/promises' {

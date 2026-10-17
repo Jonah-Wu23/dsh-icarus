@@ -37,7 +37,14 @@ export interface WindowService {
   delivered(deliverableId: string): void
 }
 
-export function createWindowService(database: IcarusDatabase, missions: MissionService, store: RunStore, now: () => number = Date.now): WindowService {
+export interface WindowOptions {
+  /** Latest published preference revision; defaults to the maximum stored revision. */
+  readonly latestPreference?: ((missionId: string) => number | null) | undefined
+  /** True while feedback is waiting for its consolidation Run; the window is not prepared yet. */
+  readonly pendingConsolidation?: ((missionId: string) => boolean) | undefined
+}
+
+export function createWindowService(database: IcarusDatabase, missions: MissionService, store: RunStore, now: () => number = Date.now, options: WindowOptions = {}): WindowService {
   const { db, paths } = database
   const decode = (row: WindowRow): DeliveryWindow => ({ ...row, inputRefs: JSON.parse(row.inputRefs) as string[] })
   function get(id: string): DeliveryWindow {
@@ -46,16 +53,23 @@ export function createWindowService(database: IcarusDatabase, missions: MissionS
     return decode(row)
   }
   function preferenceOf(missionId: string): number | null {
+    if (options.latestPreference !== undefined) return options.latestPreference(missionId)
     return db.prepare('SELECT MAX(revision) AS revision FROM PreferenceRevision WHERE missionId = ?').get<{ revision: number | null }>(missionId)?.revision ?? null
+  }
+  function delivering(missionId: string): boolean {
+    return options.pendingConsolidation?.(missionId) === true
   }
   function unassigned(mission: Mission, preference: number | null): readonly { readonly id: string; readonly observedAt: number }[] {
     return db.prepare(`SELECT Observation.id, Observation.observedAt FROM Observation JOIN Source ON Source.id = Observation.sourceId
       WHERE Source.missionId = ? AND NOT EXISTS (
         SELECT 1 FROM ObservationAssessment WHERE observationId = Observation.id AND missionId = ? AND missionRevision = ? AND preferenceRevision = ?
       ) AND NOT EXISTS (
+        SELECT 1 FROM ObservationAssessment AS prior JOIN Run AS priorRun ON priorRun.id = prior.runId JOIN DeliveryWindow AS priorWindow ON priorWindow.id = priorRun.deliveryWindowId
+        WHERE prior.observationId = Observation.id AND prior.missionId = ? AND prior.selected = 1 AND priorWindow.deliverableId IS NOT NULL
+      ) AND NOT EXISTS (
         SELECT 1 FROM DeliveryWindow, json_each(DeliveryWindow.inputRefs) AS reserved
         WHERE DeliveryWindow.missionId = ? AND DeliveryWindow.missionRevision = ? AND DeliveryWindow.status <> 'superseded' AND reserved.value = Observation.id
-      ) ORDER BY Observation.observedAt, Observation.id LIMIT 20`).all<{ id: string; observedAt: number }>(mission.id, mission.id, mission.revision, preference ?? 0, mission.id, mission.revision)
+      ) ORDER BY Observation.observedAt, Observation.id LIMIT 20`).all<{ id: string; observedAt: number }>(mission.id, mission.id, mission.revision, preference ?? 0, mission.id, mission.id, mission.revision)
   }
   function create(mission: Mission, key: string, dueAt: number, prepareAt: number, input: readonly string[], preference: number | null): void {
     db.prepare(`INSERT INTO DeliveryWindow(id, missionId, missionRevision, preferenceRevision, windowKey, prepareAt, dueAt, timezone, status, inputRefs, createdAt)
@@ -70,17 +84,19 @@ export function createWindowService(database: IcarusDatabase, missions: MissionS
       for (const mission of missions.list({ status: 'active' })) {
         const sourceCount = db.prepare('SELECT COUNT(*) AS count FROM Source WHERE missionId = ?').get<{ count: number }>(mission.id)!.count
         if (sourceCount === 0 && mission.deliveryPolicy === undefined) continue
+        // Pending feedback owns the next version: the window is created in a later pass.
+        if (delivering(mission.id)) continue
         const preference = preferenceOf(mission.id)
         if (mission.deliveryPolicy?.mode === 'changes') {
           const batch = unassigned(mission, preference)
           const first = batch[0]
-          if (first !== undefined) create(mission, `changes:${first.id}`, first.observedAt, first.observedAt, batch.map(item => item.id), preference)
+          if (first !== undefined) create(mission, `changes:${first.id}`, first.observedAt, first.observedAt, batch.map(item => item.id), null)
         } else if (mission.nextDueAt !== null) {
           const outstanding = db.prepare(`SELECT id FROM DeliveryWindow WHERE missionId = ? AND missionRevision = ? AND status IN ('open','prepared','failed')
             AND (deliverableId IS NULL OR NOT EXISTS(SELECT 1 FROM Outbox WHERE Outbox.deliverableId = DeliveryWindow.deliverableId AND Outbox.status = 'sent')) LIMIT 1`).get(mission.id, mission.revision)
           if (outstanding === undefined) {
             const due = mission.nextDueAt
-            create(mission, `digest:${due}`, due, due - (mission.deliveryPolicy?.prepareAheadMs ?? 600_000), [], preference)
+            create(mission, `digest:${due}`, due, due - (mission.deliveryPolicy?.prepareAheadMs ?? 600_000), [], null)
             const next = mission.schedule.kind === 'once' ? null : nextDueAt(mission.schedule, mission.timezone, Math.max(now(), due))
             db.prepare('UPDATE Mission SET nextDueAt = ? WHERE id = ?').run(next, mission.id)
           }
@@ -94,10 +110,14 @@ export function createWindowService(database: IcarusDatabase, missions: MissionS
       ORDER BY prepareAt, DeliveryWindow.id`).all<{ id: string }>(now())
     const enqueued: string[] = []
     for (const row of ids) {
+      const window = get(row.id)
+      // One consolidation Run at a time: the window is prepared after the version is published.
+      if (delivering(window.missionId)) continue
+      const preference = preferenceOf(window.missionId)
       const run = store.enqueueWindow(row.id)
       if (run !== null) {
-        const window = get(row.id)
-        db.prepare('UPDATE Run SET preferenceRevision = ? WHERE id = ?').run(window.preferenceRevision, run.id)
+        db.prepare('UPDATE DeliveryWindow SET preferenceRevision = ? WHERE id = ? AND status = ?').run(preference, row.id, 'open')
+        db.prepare('UPDATE Run SET preferenceRevision = ? WHERE id = ?').run(preference, run.id)
         enqueued.push(run.id)
       }
     }
@@ -115,8 +135,12 @@ export function createWindowService(database: IcarusDatabase, missions: MissionS
       return db.prepare(`SELECT Observation.id FROM Observation JOIN Source ON Source.id = Observation.sourceId
         WHERE Source.missionId = ? AND NOT EXISTS(SELECT 1 FROM ObservationAssessment
           WHERE observationId = Observation.id AND missionId = ? AND missionRevision = ? AND preferenceRevision = ?)
+        AND NOT EXISTS(
+          SELECT 1 FROM ObservationAssessment AS prior JOIN Run AS priorRun ON priorRun.id = prior.runId JOIN DeliveryWindow AS priorWindow ON priorWindow.id = priorRun.deliveryWindowId
+          WHERE prior.observationId = Observation.id AND prior.missionId = ? AND prior.selected = 1 AND priorWindow.deliverableId IS NOT NULL
+        )
         AND (? = '[]' OR Observation.id IN (SELECT value FROM json_each(?)))
-        ORDER BY observedAt, Observation.id LIMIT ?`).all<{ id: string }>(window.missionId, window.missionId, window.missionRevision, window.preferenceRevision ?? 0, JSON.stringify(window.inputRefs), JSON.stringify(window.inputRefs), limit).map(row => row.id)
+        ORDER BY observedAt, Observation.id LIMIT ?`).all<{ id: string }>(window.missionId, window.missionId, window.missionRevision, window.preferenceRevision ?? 0, window.missionId, JSON.stringify(window.inputRefs), JSON.stringify(window.inputRefs), limit).map(row => row.id)
     },
     suppress(windowId, runId, instanceId, outcome) {
       store.committable(runId, instanceId)

@@ -26,9 +26,14 @@ interface StoredBot {
   readonly segments?: unknown
 }
 
+function ownsSession(bot: StoredBot, sessionId: string): boolean {
+  if (bot.id === sessionId || bot.sessionId === sessionId) return true
+  return Array.isArray(bot.segments) && bot.segments.includes(sessionId)
+}
+
 export async function identityForSession(sessionId: string, options: IdentityOptions = {}): Promise<BotIdentity> {
   const state = JSON.parse(await readFile(statePathOf(options), 'utf8')) as StoredState
-  const bot = Object.values(state.bots ?? {}).find(bot => bot.id === sessionId || bot.sessionId === sessionId)
+  const bot = Object.values(state.bots ?? {}).find(candidate => ownsSession(candidate, sessionId))
   if (bot === undefined || typeof bot.id !== 'string') throw new Error('icarus: this Session is not a current Bot conversation')
   return { botId: bot.id, sessionId: typeof bot.sessionId === 'string' ? bot.sessionId : bot.id, name: typeof bot.name === 'string' ? bot.name : bot.id }
 }

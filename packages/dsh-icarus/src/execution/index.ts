@@ -15,11 +15,17 @@ import { createCapabilityService } from '../capabilities/index.js'
 import { createContextService } from '../context/index.js'
 import { createWindowService } from './windows.js'
 import { createCurationService } from './curation.js'
+import { createFeedbackService } from '../feedback/index.js'
+import { createInvestigationService } from '../investigation/index.js'
+import { createExplorationService } from '../investigation/exploration.js'
 import type { SourceService } from '../sources/index.js'
 import type { CapabilityService } from '../capabilities/index.js'
 import type { ContextService } from '../context/index.js'
 import type { WindowService } from './windows.js'
 import type { CurationService } from './curation.js'
+import type { FeedbackService } from '../feedback/index.js'
+import type { InvestigationService } from '../investigation/index.js'
+import type { ExplorationService } from '../investigation/exploration.js'
 import { createFaultService } from './faults.js'
 import type { FaultService } from './faults.js'
 import type { MissionService } from '../domain/index.js'
@@ -81,6 +87,9 @@ export interface IcarusExecution {
   readonly context: ContextService
   readonly windows: WindowService
   readonly curation: CurationService
+  readonly feedback: FeedbackService
+  readonly investigation: InvestigationService
+  readonly exploration: ExplorationService
   readonly instanceId: string
   readonly runs: RunService
   /** Internals, for M2.4/M2.5 and for driving a lifecycle in tests. */
@@ -116,8 +125,14 @@ export function createExecution(options: ExecutionOptions): IcarusExecution {
   }, options.search, options.missions)
   const capabilities = createCapabilityService(options.ctx, options.database, options.missions, options.search)
   const context = createContextService(options.ctx, options.database, capabilities, options.dshHome)
-  const windows = createWindowService(options.database, options.missions, store, now)
-  const curation = createCurationService({ ctx: options.ctx, database: options.database, store, windows, sources, context, capabilities, instanceId })
+  const feedback = createFeedbackService(options.database, { now })
+  const investigation = createInvestigationService({ database: options.database, missions: options.missions, store, now, newId })
+  const exploration = createExplorationService({ database: options.database, missions: options.missions, now, newId })
+  const windows = createWindowService(options.database, options.missions, store, now, {
+    latestPreference: missionId => feedback.latestPublished(missionId),
+    pendingConsolidation: missionId => feedback.needsConsolidation().some(item => item.missionId === missionId),
+  })
+  const curation = createCurationService({ ctx: options.ctx, database: options.database, store, windows, sources, context, capabilities, instanceId, exploration })
   const outbox = createOutboxService({
     database: options.database,
     ctx: options.ctx,
@@ -134,11 +149,16 @@ export function createExecution(options: ExecutionOptions): IcarusExecution {
       if (run === undefined) throw new Error('icarus: confirmed delivery has no Run')
       const mission = options.missions.get(run.missionId)
       if (mission.revision === run.missionRevision && mission.status !== 'cancelled' && mission.status !== 'completed') options.missions.recordDelivery(mission.id)
+      // A proactive child investigation settles its reserved weekly allocation on delivery.
+      if (exploration.findLaunch(run.missionId) !== undefined) exploration.settle(run.missionId)
     },
   })
   const executor = createExecutor({
     search: options.search,
     curation,
+    feedback,
+    investigation,
+    exploration,
     windows,
     capabilities,
     faults,
@@ -156,8 +176,23 @@ export function createExecution(options: ExecutionOptions): IcarusExecution {
     maxOutputTokens: options.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS,
     userTokenBudget: options.userTokenBudget ?? null,
   })
+  function queueConsolidations(): void {
+    for (const item of feedback.needsConsolidation()) {
+      try {
+        // A consolidation that already failed does not loop: a later feedback or an explicit
+        // consolidate action is what queues the next attempt.
+        const latest = options.database.db.prepare("SELECT status, createdAt FROM Run WHERE missionId = ? AND purpose = 'preference' ORDER BY createdAt DESC, generation DESC LIMIT 1").get<{ status: string; createdAt: number }>(item.missionId)
+        if (latest !== undefined && ['failed', 'budget_exhausted', 'cancelled', 'superseded'].includes(latest.status)) {
+          const newest = options.database.db.prepare(`SELECT MAX(Feedback.createdAt) AS at FROM Feedback JOIN Deliverable ON Deliverable.id = Feedback.deliverableId
+            JOIN Run ON Run.id = Deliverable.runId WHERE Run.missionId = ? AND Feedback.status = 'recorded'`).get<{ at: number | null }>(item.missionId)?.at ?? null
+          if (newest === null || newest <= latest.createdAt) continue
+        }
+        store.enqueuePurpose(item.missionId, 'preference', item.feedbackIds)
+      } catch (error) { options.ctx.logger.warn('icarus: could not queue preference consolidation for %s: %s', item.missionId, errorText(error)) }
+    }
+  }
   const scheduler = createScheduler({
-    enqueueWindows: () => windows.scan(),
+    enqueueWindows: () => { queueConsolidations(); return windows.scan() },
     database: options.database,
     store,
     executor,
@@ -185,7 +220,7 @@ export function createExecution(options: ExecutionOptions): IcarusExecution {
   }
 
   return {
-    sources, capabilities, context, windows, curation, faults,
+    sources, capabilities, context, windows, curation, feedback, investigation, exploration, faults,
     instanceId,
     runs: { get: runId => store.get(runId), list: filter => store.list(filter), tick },
     store,

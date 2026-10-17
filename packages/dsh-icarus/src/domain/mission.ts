@@ -8,7 +8,8 @@ import { IllegalMissionTransitionError } from './errors.js'
 import type { Schedule } from './schedule.js'
 import type { MissionBindings } from './bindings.js'
 
-export const MISSION_KINDS = ['once', 'recurring'] as const
+/** once and investigate are one-occurrence kinds; investigate is the bounded inquiry Mission. */
+export const MISSION_KINDS = ['once', 'recurring', 'investigate'] as const
 export type MissionKind = (typeof MISSION_KINDS)[number]
 
 export const MISSION_STATUSES = ['active', 'paused', 'completed', 'cancelled'] as const
@@ -82,15 +83,22 @@ export function assertTransition(missionId: string, from: MissionStatus, to: Mis
  * it had — a single delivery never completes it; a `once` Mission is completed.
  */
 export function transitionOnDelivered(mission: Pick<Mission, 'id' | 'kind' | 'status'>): MissionStatus {
-  if (mission.kind !== 'once') return mission.status
+  if (mission.kind === 'recurring') return mission.status
   assertTransition(mission.id, mission.status, 'completed')
   return 'completed'
 }
 
-/** `once` Missions fire a fixed instant; `recurring` Missions use daily or cron timing. */
+/** One-occurrence kinds fire a fixed instant; `recurring` uses daily or cron timing. */
+export function isOneShotKind(kind: MissionKind): boolean {
+  return kind === 'once' || kind === 'investigate'
+}
+
 export function assertKindSchedule(kind: MissionKind, schedule: Schedule): void {
   if (kind === 'once' && schedule.kind !== 'once') {
     throw new TypeError(`icarus: kind "once" needs a once schedule, got ${schedule.kind}`)
+  }
+  if (kind === 'investigate' && schedule.kind !== 'once') {
+    throw new TypeError('icarus: kind "investigate" needs a once schedule')
   }
   if (kind === 'recurring' && schedule.kind === 'once') {
     throw new TypeError('icarus: kind "recurring" needs a daily or cron schedule, not once')

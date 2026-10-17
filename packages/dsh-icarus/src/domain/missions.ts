@@ -16,11 +16,13 @@
 // is still waiting for that edit.
 import { MissionNotFoundError, MissionStateError } from './errors.js'
 import { newId } from './ids.js'
-import { assertKindSchedule, assertTransition, isMissionKind, isMissionStatus, transitionOnDelivered } from './mission.js'
+import { assertKindSchedule, assertTransition, isMissionKind, isMissionStatus, isOneShotKind, transitionOnDelivered } from './mission.js'
 import { assertTimeZone, nextDueAt, parseSchedule } from './schedule.js'
+import { MISSION_KINDS } from './mission.js'
 import type { Mission, MissionKind, MissionRevision, MissionStatus } from './mission.js'
 import type { Schedule } from './schedule.js'
 import { parseBindings } from './bindings.js'
+import { effectiveRequirements, templateOf } from '../templates/index.js'
 import type { MissionBindings } from './bindings.js'
 import type { IcarusDatabase } from '../storage/index.js'
 
@@ -212,7 +214,9 @@ export function createMissionService(database: IcarusDatabase, options: MissionS
     const ownerBotId = nonEmptyString(input.ownerBotId, 'ownerBotId')
     const objective = nonEmptyString(input.objective, 'objective')
     const kind = requireKind(input.kind)
-    const requirements = parseRequirements(input.requirements)
+    const bindings = parseBindings({ ...bindingFields(input) })
+    // The template only supplies defaults; requirements the user stated stay first and win.
+    const requirements = effectiveRequirements(templateOf(bindings.template?.id), parseRequirements(input.requirements))
     const schedule = parseSchedule(input.schedule)
     const timezone = assertTimeZone(input.timezone)
     const budget = parseBudget(input.budget)
@@ -222,13 +226,13 @@ export function createMissionService(database: IcarusDatabase, options: MissionS
     const dueAt = nextDueAt(schedule, timezone, at)
     const requirementsJson = JSON.stringify(requirements)
     const scheduleJson = JSON.stringify(schedule)
-    const bindings = JSON.stringify(parseBindings({ ...bindingFields(input) }))
+    const bindingsJson = JSON.stringify(bindings)
     inTransaction(database, () => {
       database.db.prepare(INSERT_MISSION).run(
         id, ownerBotId, kind, objective, requirementsJson, 1, 'active', scheduleJson, timezone,
-        budget, authorizationRef, 0, dueAt, at, at, bindings,
+        budget, authorizationRef, 0, dueAt, at, at, bindingsJson,
       )
-      database.db.prepare(INSERT_REVISION).run(id, 1, kind, objective, requirementsJson, scheduleJson, timezone, budget, authorizationRef, at, bindings)
+      database.db.prepare(INSERT_REVISION).run(id, 1, kind, objective, requirementsJson, scheduleJson, timezone, budget, authorizationRef, at, bindingsJson)
     })
     return get(id)
   }
@@ -240,7 +244,9 @@ export function createMissionService(database: IcarusDatabase, options: MissionS
     }
     const kind = patch.kind === undefined ? current.kind : requireKind(patch.kind)
     const objective = patch.objective === undefined ? current.objective : nonEmptyString(patch.objective, 'objective')
-    const requirements = patch.requirements === undefined ? current.requirements : parseRequirements(patch.requirements)
+    const bindingsPatch = { ...bindingFields(current), ...bindingFields(patch) }
+    const parsedBindings = parseBindings(bindingsPatch)
+    const requirements = parseRequirements(patch.requirements === undefined ? current.requirements : patch.requirements)
     const schedule = patch.schedule === undefined ? current.schedule : parseSchedule(patch.schedule)
     const timezone = patch.timezone === undefined ? current.timezone : assertTimeZone(patch.timezone)
     const budget = patch.budget === undefined ? current.budget : parseBudget(patch.budget)
@@ -255,13 +261,13 @@ export function createMissionService(database: IcarusDatabase, options: MissionS
     // A `once` Mission whose one occurrence is already consumed and which never delivered has no
     // other way back, so this edit re-arms it. An occurrence in flight is fine: this revision bump
     // supersedes that Run anyway, and the re-armed instant is what runs the new revision.
-    const rearm = patchedDueAt === null && kind === 'once' && current.status === 'active'
+    const rearm = patchedDueAt === null && isOneShotKind(kind) && current.status === 'active'
     const rearmedAt = at + RESCHEDULE_DELAY_MS
     const dueAt = rearm ? rearmedAt : patchedDueAt
     const storedSchedule: Schedule = rearm ? { kind: 'once', at: rearmedAt } : schedule
     const requirementsJson = JSON.stringify(requirements)
     const scheduleJson = JSON.stringify(storedSchedule)
-    const bindings = JSON.stringify(parseBindings({ ...bindingFields(current), ...bindingFields(patch) }))
+    const bindings = JSON.stringify(parsedBindings)
     inTransaction(database, () => {
       database.db.prepare(`UPDATE Mission SET kind = ?, objective = ?, requirements = ?, schedule = ?, timezone = ?,
         budget = ?, authorizationRef = ?, revision = revision + 1, nextDueAt = ?, updatedAt = ?, bindings = ? WHERE id = ?`)
@@ -321,7 +327,7 @@ export function createMissionService(database: IcarusDatabase, options: MissionS
     pause: id => transition(id, 'paused'),
     resume: id => {
       const mission = transition(id, 'active')
-      const rearm = mission.kind === 'once' && mission.nextDueAt === null && !missionIdsWithDeliverable([id]).has(id)
+      const rearm = isOneShotKind(mission.kind) && mission.nextDueAt === null && !missionIdsWithDeliverable([id]).has(id)
       return rearm ? modify(id, {}) : mission
     },
     cancel: id => transition(id, 'cancelled'),
@@ -361,12 +367,16 @@ function bindingFields(value: MissionBindings): MissionBindings {
     ...(value.contextRefs === undefined ? {} : { contextRefs: value.contextRefs }),
     ...(value.capabilityRequirements === undefined ? {} : { capabilityRequirements: value.capabilityRequirements }),
     ...(value.deliveryPolicy === undefined ? {} : { deliveryPolicy: value.deliveryPolicy }),
+    ...(value.template === undefined ? {} : { template: value.template }),
+    ...(value.investigation === undefined ? {} : { investigation: value.investigation }),
+    ...(value.explorationPolicy === undefined ? {} : { explorationPolicy: value.explorationPolicy }),
+    ...(value.maxModelRequestsPerRun === undefined ? {} : { maxModelRequestsPerRun: value.maxModelRequestsPerRun }),
   }
 }
 
 /** The view invariant: `active`, nothing due, nothing running, nothing delivered — a dead end. */
 function needsReschedule(row: MissionRow, inFlight: boolean, delivered: boolean): boolean {
-  return row.kind === 'once' && row.status === 'active' && row.nextDueAt === null && !inFlight && !delivered
+  return row.kind !== 'recurring' && row.status === 'active' && row.nextDueAt === null && !inFlight && !delivered
 }
 
 function nonEmptyString(value: unknown, field: string): string {
@@ -375,7 +385,7 @@ function nonEmptyString(value: unknown, field: string): string {
 }
 
 function requireKind(value: unknown): MissionKind {
-  if (!isMissionKind(value)) throw new TypeError(`icarus: kind must be one of ${JSON.stringify(['once', 'recurring'])}, got ${JSON.stringify(value)}`)
+  if (!isMissionKind(value)) throw new TypeError(`icarus: kind must be one of ${JSON.stringify(MISSION_KINDS)}, got ${JSON.stringify(value)}`)
   return value
 }
 

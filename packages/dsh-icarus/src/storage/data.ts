@@ -23,6 +23,7 @@ export function deleteMissionData(database: IcarusDatabase, missionId: string): 
   const directories = ownedDirectories(database, [missionId])
   const removed = inTransaction(database, () => {
     detachSearchAccounting(database, [missionId])
+    detachExploration(database, [missionId])
     return database.db.prepare('DELETE FROM Mission WHERE id = ?').run(missionId)
   })
   const missions = Number(removed.changes)
@@ -42,6 +43,7 @@ export function deleteBotData(database: IcarusDatabase, ownerBotId: string): Del
   const directories = ownedDirectories(database, missionIds)
   const removed = inTransaction(database, () => {
     detachSearchAccounting(database, missionIds)
+    detachExploration(database, missionIds)
     return database.db.prepare('DELETE FROM Mission WHERE ownerBotId = ?').run(ownerBotId)
   })
   const artifacts = removeArtifacts(database.paths.artifactsDir, refs)
@@ -74,6 +76,13 @@ function collectArtifactRefs(database: IcarusDatabase, missionIds: readonly stri
     { sql: `SELECT evidenceRef AS value FROM Observation WHERE sourceId IN (SELECT id FROM Source WHERE missionId IN (${ids}))`, list: false },
     { sql: `SELECT evidenceRefs AS value FROM Deliverable WHERE runId IN (SELECT id FROM Run WHERE missionId IN (${ids}))`, list: true },
     { sql: `SELECT artifactRefs AS value FROM Deliverable WHERE runId IN (SELECT id FROM Run WHERE missionId IN (${ids}))`, list: true },
+    { sql: `SELECT changeRef AS value FROM PreferenceRevision WHERE missionId IN (${ids})`, list: false },
+    { sql: `SELECT summaryRef AS value FROM InvestigationCheckpoint WHERE missionId IN (${ids})`, list: false },
+    { sql: `SELECT traceRef AS value FROM InvestigationCheckpoint WHERE missionId IN (${ids})`, list: false },
+    { sql: `SELECT artifactRefs AS value FROM InvestigationCheckpoint WHERE missionId IN (${ids})`, list: true },
+    { sql: `SELECT stdoutRef AS value FROM RunCommand WHERE missionId IN (${ids})`, list: false },
+    { sql: `SELECT stderrRef AS value FROM RunCommand WHERE missionId IN (${ids})`, list: false },
+    { sql: `SELECT originSnapshotRef AS value FROM DeliverableItem WHERE deliverableId IN (SELECT Deliverable.id FROM Deliverable JOIN Run ON Run.id = Deliverable.runId WHERE Run.missionId IN (${ids}))`, list: false },
   ]
   for (const source of sources) {
     for (const row of database.db.prepare(source.sql).all<{ value: string | null }>(...missionIds)) {
@@ -82,7 +91,24 @@ function collectArtifactRefs(database: IcarusDatabase, missionIds: readonly stri
       else refs.add(row.value)
     }
   }
+  // Investigation bindings name the self-contained origin snapshot; it has no dedicated column.
+  for (const row of database.db.prepare(`SELECT bindings FROM Mission WHERE id IN (${ids})`).all<{ bindings: string }>()) {
+    try {
+      const bindings = JSON.parse(row.bindings) as { investigation?: { originSnapshotRef?: unknown } }
+      if (typeof bindings.investigation?.originSnapshotRef === 'string') refs.add(bindings.investigation.originSnapshotRef)
+    } catch { /* a malformed binding is reported by the Mission reader, not here */ }
+  }
   return refs
+}
+
+/** Keep the weekly accounting of a deleted child investigation; the parent keeps its history. */
+function detachExploration(database: IcarusDatabase, missionIds: readonly string[]): void {
+  const slots = missionIds.map(() => '?').join(', ')
+  for (const missionId of missionIds) {
+    const usage = database.db.prepare('SELECT budgetUsed FROM Mission WHERE id = ?').get<{ budgetUsed: number }>(missionId)?.budgetUsed ?? 0
+    database.db.prepare(`UPDATE ExplorationAllocation SET status = 'settled', usedTokens = MAX(usedTokens, ?), settledAt = ? WHERE childMissionId = ?`).run(usage, Date.now(), missionId)
+  }
+  database.db.prepare(`UPDATE ExplorationProposal SET investigationMissionId = NULL WHERE investigationMissionId IN (${slots})`).run(...missionIds)
 }
 
 function detachSearchAccounting(database: IcarusDatabase, missionIds: readonly string[]): void {
@@ -116,12 +142,13 @@ export function exportMissionData(database: IcarusDatabase, missionId: string): 
   const mission = database.db.prepare('SELECT * FROM Mission WHERE id = ?').get(missionId)
   if (mission === undefined) throw new Error('icarus: Mission does not exist')
   const result: Record<string, unknown> = { Mission: mission }
-  const direct = ['MissionRevision', 'Source', 'Run', 'PreferenceRevision', 'DeliveryWindow', 'ObservationAssessment', 'CapabilityCheck', 'CapabilityRecommendation', 'ToolReading', 'Fault', 'SearchCall']
+  const direct = ['MissionRevision', 'Source', 'Run', 'PreferenceRevision', 'PreferenceEntry', 'ReadEvent', 'DeliveryWindow', 'ObservationAssessment', 'CapabilityCheck', 'CapabilityRecommendation', 'ToolReading', 'Fault', 'SearchCall', 'InvestigationCheckpoint', 'RunCommand', 'ExplorationProposal', 'ExplorationAllocation']
   for (const table of direct) result[table] = database.db.prepare(`SELECT * FROM ${table} WHERE missionId = ?`).all(missionId)
   const queries: Record<string, string> = {
     Observation: 'sourceId IN (SELECT id FROM Source WHERE missionId = ?)',
     SourceAttempt: 'sourceId IN (SELECT id FROM Source WHERE missionId = ?)',
     Deliverable: 'runId IN (SELECT id FROM Run WHERE missionId = ?)',
+    DeliverableItem: 'deliverableId IN (SELECT Deliverable.id FROM Deliverable JOIN Run ON Run.id = Deliverable.runId WHERE Run.missionId = ?)',
     RunStep: 'runId IN (SELECT id FROM Run WHERE missionId = ?)',
     Reading: 'runId IN (SELECT id FROM Run WHERE missionId = ?)',
     ModelCall: 'runId IN (SELECT id FROM Run WHERE missionId = ?)',
@@ -130,6 +157,9 @@ export function exportMissionData(database: IcarusDatabase, missionId: string): 
     OutboxAttempt: 'outboxId IN (SELECT Outbox.id FROM Outbox JOIN Deliverable ON Deliverable.id = Outbox.deliverableId JOIN Run ON Run.id = Deliverable.runId WHERE Run.missionId = ?)',
   }
   for (const [table, where] of Object.entries(queries)) result[table] = database.db.prepare(`SELECT * FROM ${table} WHERE ${where}`).all(missionId)
+  // Parent export names its child investigations, and a child export names the allocation that started it.
+  result.children = database.db.prepare('SELECT id, objective, kind, status, createdAt FROM Mission WHERE id IN (SELECT investigationMissionId FROM ExplorationProposal WHERE missionId = ? AND investigationMissionId IS NOT NULL) ORDER BY createdAt').all(missionId)
+  result.parentLaunch = database.db.prepare('SELECT * FROM ExplorationAllocation WHERE childMissionId = ?').all(missionId)
   const refs = collectArtifactRefs(database, [missionId])
   const files: Record<string, string> = {}
   for (const ref of refs) {

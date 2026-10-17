@@ -3,6 +3,7 @@ import { resolveIdentity } from '../bridge/identity.js'
 import { inTransaction } from '../domain/index.js'
 import { newId } from '../domain/ids.js'
 import { readArtifact, writeArtifact } from './artifacts.js'
+import { listItems } from './items.js'
 import type { IcarusContext } from '../types/host.js'
 import type { IcarusDatabase } from '../storage/index.js'
 import type { OutboxView } from './runs.js'
@@ -46,7 +47,7 @@ export class OutboxNotFoundError extends Error {
 }
 
 interface OutboxRow extends OutboxView { readonly purpose: 'deliverable' | 'fault' }
-interface DeliveryTarget { readonly content: string; readonly ownerBotId: string; readonly revision: number; readonly missionRevision: number; readonly missionStatus: string; readonly deliveryWindowId: string | null; readonly windowStatus: string | null; readonly windowDeliverable: string | null; readonly dueAt: number | null; readonly activeFault: number }
+interface DeliveryTarget { readonly content: string; readonly missionId: string; readonly ownerBotId: string; readonly revision: number; readonly missionRevision: number; readonly missionStatus: string; readonly deliveryWindowId: string | null; readonly windowStatus: string | null; readonly windowDeliverable: string | null; readonly dueAt: number | null; readonly activeFault: number }
 const OUTBOX_COLUMNS = 'id, deliverableId, channel, destinationRef, status, attemptCount, receiptRef, nextAttemptAt, purpose'
 
 export function createOutboxService(options: OutboxOptions): OutboxService {
@@ -62,8 +63,18 @@ export function createOutboxService(options: OutboxOptions): OutboxService {
     if (row === undefined) throw new OutboxNotFoundError(id)
     return row
   }
+  /** What the pre-authorized investigations did, so the Bot can explain started and deferred proposals. */
+  function explorationSummary(deliverableId: string): string {
+    const rows = db.prepare('SELECT question, status, decidedReason, investigationMissionId FROM ExplorationProposal WHERE deliverableId = ? ORDER BY createdAt').all<{ question: string; status: string; decidedReason: string | null; investigationMissionId: string | null }>(deliverableId)
+    if (rows.length === 0) return ''
+    const lines = rows.map(row => row.status === 'launched'
+      ? `已启动调查：${row.question}（Mission ${row.investigationMissionId ?? '?'}）`
+      : `待决定建议：${row.question}（${row.decidedReason ?? row.status}）`)
+    return `\n\n主动调查：\n${lines.join('\n')}`
+  }
+
   function target(row: OutboxRow): DeliveryTarget {
-    const result = db.prepare(`SELECT Deliverable.content, Mission.ownerBotId, Mission.revision, Mission.status AS missionStatus, Run.missionRevision, Run.deliveryWindowId,
+    const result = db.prepare(`SELECT Deliverable.content, Mission.id AS missionId, Mission.ownerBotId, Mission.revision, Mission.status AS missionStatus, Run.missionRevision, Run.deliveryWindowId,
       DeliveryWindow.status AS windowStatus, DeliveryWindow.deliverableId AS windowDeliverable, DeliveryWindow.dueAt,
       EXISTS(SELECT 1 FROM Fault WHERE Fault.deliverableId = Deliverable.id AND Fault.clearedAt IS NULL) AS activeFault
       FROM Deliverable JOIN Run ON Run.id = Deliverable.runId JOIN Mission ON Mission.id = Run.missionId
@@ -121,8 +132,11 @@ export function createOutboxService(options: OutboxOptions): OutboxService {
         db.prepare('UPDATE OutboxAttempt SET sessionId = ? WHERE id = ?').run(sessionId, attemptId)
       })
       stopping.signal.throwIfAborted()
+      const items = listItems(options.database, { deliverableId: row.deliverableId })
+      const itemRecords = items.length === 0 ? '' : `\n\n记录：missionId=${destination.missionId}；deliverableId=${row.deliverableId}；${items.map(item => `${item.ordinal}. itemId=${item.id}`).join('；')}`
+      const explorationLine = explorationSummary(row.deliverableId)
       dispatched = true
-      const receipt = await deliver(options.ctx, { requestId: id, sessionId, text: `Icarus 后台成果已保存。请阅读交付记录，结合本次背景说明结论和关键依据。\n\n${destination.content}`,
+      const receipt = await deliver(options.ctx, { requestId: id, sessionId, text: `Icarus 后台成果已保存。请阅读交付记录，结合本次背景说明结论和关键依据。${items.length === 0 ? '' : '保留正文中的条目序号，itemId 仅放在结尾记录行。用户追问某个序号时，用 icarus_items 按本成果 ID 和 ordinal 读取证据。'}\n\n${destination.content}${itemRecords}${explorationLine}`,
         signal: stopping.signal, timeoutMs })
       accepted = true
       const window = current.deliveryWindowId === null ? null : db.prepare('SELECT dueAt, timezone FROM DeliveryWindow WHERE id = ?').get(current.deliveryWindowId)

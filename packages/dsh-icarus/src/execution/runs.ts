@@ -32,11 +32,17 @@ import { newId as mintId } from '../domain/ids.js'
 import { inTransaction } from '../domain/index.js'
 import { nextDueAt } from '../domain/schedule.js'
 import { modelCallUsage } from './model-budget.js'
+import { listItems, parseItemDraft } from './items.js'
+import type { DeliverableItem, ItemDraft } from './items.js'
 import type { Mission, MissionService } from '../domain/index.js'
 import type { IcarusDatabase } from '../storage/index.js'
 
 export const RUN_STATUSES = ['queued', 'running', 'awaiting_approval', 'succeeded', 'failed', 'cancelled', 'superseded', 'budget_exhausted'] as const
 export type RunStatus = (typeof RUN_STATUSES)[number]
+
+/** What a Run exists to do; `execution` covers curation and the legacy single-turn path. */
+export const RUN_PURPOSES = ['execution', 'preference', 'investigation'] as const
+export type RunPurpose = (typeof RUN_PURPOSES)[number]
 
 /** Model usage as the host reported it; only the fields the host sent are kept. */
 export interface TokenUsage {
@@ -89,6 +95,10 @@ export interface Run {
   /** Mission revision this attempt was created for. */
   readonly missionRevision: number
   readonly preferenceRevision: number | null
+  readonly purpose: RunPurpose
+  /** Structured inputs a non-execution Run reads: feedback ids for a preference Run, etc. */
+  readonly purposeRefs: readonly string[]
+  readonly resumedFromRunId: string | null
   readonly status: RunStatus
   readonly sessionId: string | null
   readonly leaseOwner: string | null
@@ -117,6 +127,7 @@ export interface OutboxView {
 }
 
 export interface DeliverableView {
+  readonly items: readonly DeliverableItem[]
   readonly id: string
   readonly runId: string
   readonly content: string
@@ -145,6 +156,7 @@ export interface RunBudgetView {
 export interface CommitInput {
   readonly windowOutcomeRef?: string
   readonly deliverable: {
+    readonly items?: readonly ItemDraft[]
     readonly id: string
     readonly content: string
     readonly contentHash: string
@@ -183,6 +195,10 @@ export interface RunStore {
   enqueueWindow(windowId: string): Run | null
   /** Create a queued Run for a Mission whose due time has arrived, and advance its due time. */
   enqueueDue(missionId: string): Run | null
+  /** Queue one internal Run (preference consolidation or investigation) for an active Mission. */
+  enqueuePurpose(missionId: string, purpose: 'preference' | 'investigation', purposeRefs?: readonly string[]): Run | null
+  /** Finish a Run whose whole product is written elsewhere (a preference version). */
+  completeInternal(runId: string, instanceId: string, outcome: { readonly status: 'succeeded'; readonly usage: TokenUsage | null }): Run
   /** Queued Run ids, oldest first. */
   queuedIds(): string[]
   /** Claim a queued Run for this instance; null when it cannot be claimed. */
@@ -240,6 +256,9 @@ interface RunRow {
   readonly missionId: string
   readonly missionRevision: number
   readonly preferenceRevision: number | null
+  readonly purpose: string
+  readonly purposeRefs: string
+  readonly resumedFromRunId: string | null
   readonly status: string
   readonly sessionId: string | null
   readonly leaseOwner: string | null
@@ -277,7 +296,7 @@ interface OutboxRow {
   readonly nextAttemptAt: number | null
 }
 
-const RUN_COLUMNS = `id, missionId, missionRevision, preferenceRevision, status, sessionId, leaseOwner, leaseUntil,
+const RUN_COLUMNS = `id, missionId, missionRevision, preferenceRevision, purpose, purposeRefs, resumedFromRunId, status, sessionId, leaseOwner, leaseUntil,
   inputRefs, usage, errorRef, approvalRefs, generation, createdAt, startedAt, endedAt, deliveryWindowId, contextRef, capabilityRef, phase`
 
 /**
@@ -303,16 +322,34 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
   }
 
   /** Insert one queued Run at the Mission's current revision. Never opens its own transaction. */
-  function insertQueued(mission: Mission, at: number, previous?: Pick<RunRow, 'deliveryWindowId' | 'inputRefs' | 'preferenceRevision' | 'contextRef'>): string {
+  function insertQueued(mission: Mission, at: number, previous?: Pick<RunRow, 'deliveryWindowId' | 'inputRefs' | 'preferenceRevision' | 'contextRef'> & Partial<Pick<RunRow, 'purpose' | 'purposeRefs'>>): string {
     const next = db.prepare('SELECT COALESCE(MAX(generation), 0) + 1 AS next FROM Run WHERE missionId = ?').get<{ next: number }>(mission.id)
     const id = newId('run')
-    db.prepare(`INSERT INTO Run (id, missionId, missionRevision, preferenceRevision, status, sessionId, leaseOwner, leaseUntil, inputRefs, usage, errorRef, approvalRefs, generation, createdAt, startedAt, endedAt)
-      VALUES (?, ?, ?, NULL, 'queued', NULL, NULL, NULL, '[]', NULL, NULL, '[]', ?, ?, NULL, NULL)`)
-      .run(id, mission.id, mission.revision, next?.next ?? 1, at)
+    const purpose = previous?.purpose ?? defaultPurposeOf(mission)
+    db.prepare(`INSERT INTO Run (id, missionId, missionRevision, preferenceRevision, purpose, purposeRefs, status, sessionId, leaseOwner, leaseUntil, inputRefs, usage, errorRef, approvalRefs, generation, createdAt, startedAt, endedAt)
+      VALUES (?, ?, ?, NULL, ?, ?, 'queued', NULL, NULL, NULL, '[]', NULL, NULL, '[]', ?, ?, NULL, NULL)`)
+      .run(id, mission.id, mission.revision, purpose, previous?.purposeRefs ?? '[]', next?.next ?? 1, at)
     const preference = previous?.preferenceRevision ?? db.prepare('SELECT MAX(revision) AS revision FROM PreferenceRevision WHERE missionId = ?').get<{ revision: number | null }>(mission.id)?.revision ?? null
     db.prepare('UPDATE Run SET deliveryWindowId = ?, inputRefs = ?, preferenceRevision = ?, contextRef = ? WHERE id = ?')
       .run(previous?.deliveryWindowId ?? null, previous?.inputRefs ?? '[]', preference, previous?.contextRef ?? null, id)
     return id
+  }
+
+  function defaultPurposeOf(mission: Mission): RunPurpose {
+    return mission.kind === 'investigate' ? 'investigation' : 'execution'
+  }
+
+  function inFlight(missionId: string): boolean {
+    return db.prepare(`SELECT id FROM Run WHERE missionId = ? AND status IN ('queued', ${EXECUTING_STATUSES}) LIMIT 1`).get(missionId) !== undefined
+  }
+
+  function enqueuePurpose(missionId: string, purpose: 'preference' | 'investigation', purposeRefs: readonly string[] = []): Run | null {
+    return inTransaction(database, () => {
+      const mission = options.missions.get(missionId)
+      if (mission.status !== 'active' || inFlight(missionId)) return null
+      const id = insertQueued(mission, now(), { deliveryWindowId: null, inputRefs: '[]', preferenceRevision: null, contextRef: null, purpose, purposeRefs: JSON.stringify(purposeRefs) })
+      return toRun(rowOrThrow(id))
+    })
   }
 
   function enqueueWindow(windowId: string): Run | null {
@@ -373,6 +410,7 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
         evidenceRefs: parseRefs(row.evidenceRefs),
         artifactRefs: parseRefs(row.artifactRefs),
         createdAt: row.createdAt,
+        items: listItems(database, { deliverableId: row.id }),
         outbox: db
           .prepare('SELECT id, deliverableId, channel, destinationRef, status, attemptCount, receiptRef, nextAttemptAt, purpose FROM Outbox WHERE deliverableId = ? ORDER BY channel')
           .all<OutboxRow>(row.id)
@@ -393,12 +431,12 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
       if (mission.status !== 'active') return null
       if (mission.deliveryPolicy !== undefined || db.prepare('SELECT id FROM Source WHERE missionId = ? LIMIT 1').get(missionId) !== undefined) return null
       if (mission.nextDueAt === null || mission.nextDueAt > at) return null
-      if (db.prepare(`SELECT id FROM Run WHERE missionId = ? AND status IN ('queued', ${EXECUTING_STATUSES}) LIMIT 1`).get(missionId) !== undefined) return null
+      if (inFlight(missionId)) return null
       const runId = insertQueued(mission, at)
-      // A once Mission has no next occurrence, so clearing the due time is what keeps the
+      // A one-shot Mission has no next occurrence, so clearing the due time is what keeps the
       // next tick from creating another Run. A recurring Mission rolls forward, so a
       // restart after downtime produces one catch-up Run rather than a backlog.
-      const next = mission.schedule.kind === 'once' ? null : nextDueAt(mission.schedule, mission.timezone, at)
+      const next = mission.kind === 'recurring' ? nextDueAt(mission.schedule, mission.timezone, at) : null
       db.prepare('UPDATE Mission SET nextDueAt = ? WHERE id = ?').run(next, mission.id)
       return toRun(rowOrThrow(runId))
     })
@@ -420,7 +458,7 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
         // The definition moved on while this attempt waited: refuse it and queue a fresh
         // attempt at the current revision instead of spending a model call on stale text.
         supersedeRow(runId, null, at)
-        if (mission.status === 'active' && row.deliveryWindowId === null) insertQueued(mission, at)
+        if (mission.status === 'active' && row.deliveryWindowId === null) insertQueued(mission, at, row)
         return null
       }
       const result = db.prepare(`UPDATE Run SET status = 'running', leaseOwner = ?, leaseUntil = ?, startedAt = ? WHERE id = ? AND status = 'queued'`)
@@ -511,6 +549,20 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
     })
   }
 
+  function completeInternal(runId: string, instanceId: string, outcome: { readonly status: 'succeeded'; readonly usage: TokenUsage | null }): Run {
+    committable(runId, instanceId)
+    const at = now()
+    return inTransaction(database, () => {
+      const missionId = rowOrThrow(runId).missionId
+      const usage = modelCallUsage(database, runId) ?? outcome.usage
+      const result = db.prepare(`UPDATE Run SET status = 'succeeded', usage = ?, endedAt = ? WHERE id = ? AND status IN (${EXECUTING_STATUSES}) AND leaseOwner = ?`)
+        .run(usage === null ? null : JSON.stringify(usage), at, runId, instanceId)
+      if (Number(result.changes) === 0) throw new SupersededError(runId, 'the Run stopped running before its internal result was recorded')
+      settle(missionId, usage === null ? null : JSON.stringify(usage), runId)
+      return toRun(rowOrThrow(runId))
+    })
+  }
+
   function commit(runId: string, instanceId: string, input: CommitInput): CommitResult {
     committable(runId, instanceId)
     const at = now()
@@ -521,6 +573,9 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
       if (run.deliveryWindowId !== null && window?.status !== 'open') throw new SupersededError(runId, 'the delivery window is already finalized')
       const current = options.missions.get(missionId)
       if (current.status !== 'active' || current.revision !== run.missionRevision || run.leaseUntil === null || run.leaseUntil <= at) throw new SupersededError(runId, 'the Mission or lease changed before commit')
+      const items = run.purpose === 'investigation' || run.deliveryWindowId !== null
+        ? parseItemDraft(database, runId, { content: input.deliverable.content, items: input.deliverable.items }).items
+        : []
       db.prepare(`INSERT INTO Deliverable (id, runId, requirementResults, evidenceRefs, artifactRefs, content, contentHash, createdAt)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(
@@ -533,6 +588,9 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
           input.deliverable.contentHash,
           at,
         )
+      for (const item of items) db.prepare(`INSERT INTO DeliverableItem(id, deliverableId, ordinal, observationIds, assessmentIds, evidenceRefs, fields, title, url, preferenceRefs, sourceType, originItemId, originSnapshotRef, checkpointId)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(newId('item'), input.deliverable.id, item.ordinal, JSON.stringify(item.observationIds), JSON.stringify(item.assessmentIds), JSON.stringify(item.evidenceRefs), JSON.stringify(item.fields), item.title, item.url, JSON.stringify(item.preferenceRefs), item.sourceType, item.originItemId, item.originSnapshotRef, item.checkpointId)
       db.prepare(`INSERT INTO Outbox (id, deliverableId, channel, destinationRef, status, attemptCount, receiptRef, nextAttemptAt, createdAt, updatedAt)
         VALUES (?, ?, ?, NULL, 'pending', 0, NULL, ?, ?, ?)`)
         .run(input.outboxId, input.deliverable.id, input.channel, window?.dueAt ?? at, at, at)
@@ -593,6 +651,8 @@ export function createRunStore(database: IcarusDatabase, options: RunStoreOption
   return {
     enqueueDue,
     enqueueWindow,
+    enqueuePurpose,
+    completeInternal,
     queuedIds: () => db.prepare("SELECT Run.id FROM Run JOIN Mission ON Mission.id = Run.missionId WHERE Run.status = 'queued' AND Mission.status = 'active' ORDER BY Run.createdAt, Run.id").all<{ id: string }>().map(row => row.id),
     claim,
     reclaim: (runId, instanceId, leaseMs) => inTransaction(database, () => {
@@ -658,6 +718,7 @@ function parseApprovals(json: string): readonly ApprovalRef[] {
 
 function toRun(row: RunRow): Run {
   if (!RUN_STATUSES.includes(row.status as RunStatus)) throw new Error(`icarus: Run ${JSON.stringify(row.id)} has unknown status ${JSON.stringify(row.status)}`)
+  if (!RUN_PURPOSES.includes(row.purpose as RunPurpose)) throw new Error(`icarus: Run ${JSON.stringify(row.id)} has unknown purpose ${JSON.stringify(row.purpose)}`)
   return {
     deliveryWindowId: row.deliveryWindowId,
     contextRef: row.contextRef,
@@ -667,6 +728,9 @@ function toRun(row: RunRow): Run {
     missionId: row.missionId,
     missionRevision: row.missionRevision,
     preferenceRevision: row.preferenceRevision,
+    purpose: row.purpose as RunPurpose,
+    purposeRefs: parseRefs(row.purposeRefs),
+    resumedFromRunId: row.resumedFromRunId,
     status: row.status as RunStatus,
     sessionId: row.sessionId,
     leaseOwner: row.leaseOwner,

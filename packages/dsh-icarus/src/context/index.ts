@@ -13,6 +13,15 @@ export interface ContextService {
   load(run: Run, revision: MissionRevision, signal: AbortSignal): Promise<{ readonly ref: string; readonly text: string }>
 }
 
+/** Preference entries effective at the Run's pinned version, with the words that produced them. */
+export function preferenceSnapshot(db: IcarusDatabase['db'], missionId: string, revision: number | null): unknown {
+  if (revision === null) return { revision: null, entries: [] }
+  const rows = db.prepare(`SELECT id, introducedIn, retiredIn, origin, statement, scope, quote, feedbackIds, explanation, expiresAt FROM PreferenceEntry
+    WHERE missionId = ? AND introducedIn <= ? AND (retiredIn IS NULL OR retiredIn > ?) ORDER BY introducedIn, id`).all<{ id: string; introducedIn: number; retiredIn: number | null; origin: string; statement: string; scope: string; quote: string | null; feedbackIds: string; explanation: string | null; expiresAt: number | null }>(missionId, revision, revision)
+  return { revision, entries: rows.map(row => ({ id: row.id, origin: row.origin, statement: row.statement, scope: JSON.parse(row.scope) as unknown,
+    quote: row.quote, explanation: row.explanation, expiresAt: row.expiresAt, feedbackIds: JSON.parse(row.feedbackIds) as unknown, introducedIn: row.introducedIn })) }
+}
+
 export function createContextService(ctx: IcarusContext, database: IcarusDatabase, capabilities: CapabilityService, dshHome?: string): ContextService {
   const { db, paths } = database
   return {
@@ -58,8 +67,9 @@ export function createContextService(ctx: IcarusContext, database: IcarusDatabas
           entries.push({ binding, evidenceRef, version: contentHash(JSON.stringify(result)), result, reading: { scope: 'tool_result', truncated: null } })
         }
       }
-      const preference = db.prepare('SELECT * FROM PreferenceRevision WHERE missionId = ? AND revision = ?').get(run.missionId, run.preferenceRevision ?? 0) ?? null
-      const text = JSON.stringify({ objective: revision.objective, missionRevision: revision.revision, preferenceRevision: run.preferenceRevision, preference, entries })
+      const preference = preferenceSnapshot(db, run.missionId, run.preferenceRevision)
+      const text = JSON.stringify({ objective: revision.objective, requirements: revision.requirements, template: revision.template?.id ?? null,
+        missionRevision: revision.revision, preferenceRevision: run.preferenceRevision, preference, entries })
       const ref = writeArtifact(paths, `runs/${run.id}/context.json`, text)
       db.prepare('UPDATE Run SET contextRef = ? WHERE id = ?').run(ref, run.id)
       return { ref, text }

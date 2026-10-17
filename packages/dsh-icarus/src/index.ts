@@ -79,6 +79,9 @@ export interface IcarusService {
   readonly windows: import('./execution/windows.js').WindowService
   readonly deliveries: import('./execution/outbox.js').OutboxService
   readonly faults: import('./execution/faults.js').FaultService
+  readonly feedback: import('./feedback/index.js').FeedbackService
+  readonly investigations: import('./investigation/index.js').InvestigationService
+  readonly exploration: import('./investigation/exploration.js').ExplorationService
   readonly data: { exportMission(missionId: string): unknown; deleteMission(missionId: string): import('./storage/index.js').DeleteResult }
 }
 
@@ -127,7 +130,8 @@ export function apply(ctx: IcarusContext, config: IcarusConfig = {}): void {
     userTokenBudget: resolved.execution.userTokenBudget,
   })
   const service: IcarusService = { search, searchDatabase: database, missions: domain.missions, runs: execution.runs, sources: execution.sources, capabilities: execution.capabilities, windows: execution.windows, deliveries: execution.outbox,
-    faults: execution.faults, data: { exportMission: id => exportMissionData(database, id), deleteMission: id => deleteMissionData(database, id) } }
+    faults: execution.faults, feedback: execution.feedback, investigations: execution.investigation, exploration: execution.exploration,
+    data: { exportMission: id => exportMissionData(database, id), deleteMission: id => deleteMissionData(database, id) } }
   ctx.provide('icarus', service)
   registerBotTools(ctx, service, execution, database, resolved.dshHome)
   ctx.effect(() => async () => {

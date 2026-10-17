@@ -110,7 +110,7 @@ RSSHub 与 changedetection.io 可作为外部来源服务接入，Icarus 消费�
 | [Nichts0v0/dsh-mcp-manager](https://github.com/Nichts0v0/dsh-mcp-manager)，`dsh-mcp-manager` | MIT | 已安装 `0.6.0` 并挂载；管理 stdio、HTTP 与 OAuth 连接，只桥接 MCP Tools |
 | [ModSearch](https://github.com/liustack/modsearch)，`@liustack/modsearch` | MIT；默认搜索依赖 Firecrawl 的免 Key 免费额度 | 低门槛搜索和页面获取，真实渠道与额度须显示 |
 | [dsh-browser](https://github.com/anweat/dsh-browser)，`@anweat/dsh-browser` | MIT；上游声明在 `0.2.0-rc.2` 验证 | 已安装 `0.2.1` 并在后台工作区真实调用，同时是包内运行依赖 |
-| [Vision Toolkit](https://github.com/Anionex/dsh-vision-toolkit)，`@anionex/dsh-vision-toolkit` | MIT；包声明兼容 `0.2.0-rc.2` | 图像读取、OCR 与视觉比较；视觉模型提供者的收费及资料去向单列 |
+| [Vision Toolkit](https://github.com/Anionex/dsh-vision-toolkit)，`@anionex/dsh-vision-toolkit` | MIT；包声明兼容 `0.2.0-rc.2` | 已安装 `0.1.46` 并在兴趣委托后台会话真实调用（`vision_toolkit_activate`、`vision_glance`）；视觉模型使用 DeepSeek API 的 `deepseek-flash`（实测具备图像输入能力），费用随 DeepSeek 账户计量，插件未返回单次用量时记为费用未知 |
 | [Better Sidebar](https://github.com/omdsh-dev/DSH-better-sidebar)，`dsh-better-sidebar` | MIT；当前版本以 `0.2.0-rc.2+` 为基线 | 查看成果文件与工程执行状态 |
 | [GenUI](https://github.com/omdsh-dev/dsh-genui)，`@changfenhuang/dsh-genui` | MIT；当前宿主声明包含 `0.2.0-rc.2` | 在对话中呈现交互成果；反馈经 Icarus 服务写入 |
 

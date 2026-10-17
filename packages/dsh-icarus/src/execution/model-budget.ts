@@ -9,7 +9,7 @@ import type { TokenUsage } from './runs.js'
 export const DEFAULT_MAX_OUTPUT_TOKENS = 8192
 
 export class BudgetExhaustedError extends Error {
-  constructor(message: string, readonly reason: 'model' | 'search' = 'model') {
+  constructor(message: string, readonly reason: 'model' | 'search' | 'requests' = 'model') {
     super(`icarus: ${message}`)
     this.name = 'BudgetExhaustedError'
   }
@@ -56,7 +56,15 @@ export function installModelBudget(options: ModelBudgetOptions): { stop(runId: s
   const provenance = new AsyncLocalStorage<Owner>()
   let disposed = false
 
-  function ownerOf(request: ModelRequest): Owner | undefined {
+  /** Request cap pinned in the Run's Mission revision; null means the Run is not capped. */
+function maxRequestsPerRun(db: IcarusDatabase['db'], missionId: string, revision: number): number | null {
+  const row = db.prepare('SELECT bindings FROM MissionRevision WHERE missionId = ? AND revision = ?').get<{ bindings: string }>(missionId, revision)
+  if (row === undefined) return null
+  const value = (JSON.parse(row.bindings) as { maxModelRequestsPerRun?: unknown }).maxModelRequestsPerRun
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null
+}
+
+function ownerOf(request: ModelRequest): Owner | undefined {
     function promptOf(data: unknown): string | undefined {
       if (typeof data !== 'object' || data === null || !('source' in data)) return undefined
       const source = data.source
@@ -123,6 +131,11 @@ export function installModelBudget(options: ModelBudgetOptions): { stop(runId: s
         || (!owner.delivery && (mission.status !== 'active' || (run.status !== 'running' && run.status !== 'awaiting_approval')
           || run.leaseUntil === null || run.leaseUntil <= Date.now()))) {
         throw new Error('icarus: model request belongs to an inactive or superseded execution')
+      }
+      const requestLimit = maxRequestsPerRun(db, owner.missionId, owner.missionRevision)
+      if (requestLimit !== null) {
+        const registered = db.prepare('SELECT COUNT(*) AS count FROM ModelCall WHERE runId = ?').get<{ count: number }>(owner.id)?.count ?? 0
+        if (registered >= requestLimit) throw new BudgetExhaustedError(`request budget exhausted for this Run (${registered} of ${requestLimit} registered)`, 'requests')
       }
       const outstanding = db.prepare(`SELECT COALESCE(SUM(ModelCall.reservedTokens), 0) AS tokens FROM ModelCall
         JOIN Run ON Run.id = ModelCall.runId WHERE Run.missionId = ? AND ModelCall.status <> 'settled'`)
